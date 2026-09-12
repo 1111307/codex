@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="zh-CN" style="color-scheme: dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Codex 架构总览</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: { extend: { colors: {
+      wt: {
+        bg: '#000000', surface: '#0a0a0a', raised: '#141414',
+        border: '#2a2a2a', fg: '#ffffff', muted: '#a0a0a0',
+        accent: '#a855f7', file: '#c084fc', red: '#ef4444',
+      },
+      node: {
+        component: '#a855f7', composable: '#7c3aed', utility: '#6d28d9',
+        external: '#525252', event: '#d8b4fe', data: '#9333ea',
+      },
+    }}},
+  };
+</script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  body { background: #000; }
+  .mermaid-wrap svg { max-width: none !important; height: auto !important; }
+
+  .mermaid-wrap .node { cursor: pointer; }
+  .mermaid-wrap .node:hover rect,
+  .mermaid-wrap .node:hover polygon,
+  .mermaid-wrap .node:hover circle,
+  .mermaid-wrap .node:hover .label-container { filter: brightness(1.3); transition: filter .15s; }
+
+  .dt-body p { color:#a0a0a0; font-size:.88rem; line-height:1.65; margin-bottom:10px; }
+  .dt-body p code {
+    background:rgba(168,85,247,.12); padding:1px 6px; border-radius:4px;
+    font-family:'SF Mono','Fira Code',monospace; font-size:.82rem; color:#c084fc;
+  }
+
+  .dt-body .shiki, .dt-body pre.code-fallback {
+    background: #000000; border: 1px solid #2a2a2a; border-radius: 8px;
+    padding: 14px 16px; overflow-x: auto; margin: 8px 0 14px;
+  }
+  .dt-body .shiki { background: #000000 !important; }
+  .dt-body .shiki code, .dt-body pre.code-fallback code {
+    font-family: 'SF Mono','Fira Code',monospace; font-size: .78rem; line-height: 1.55;
+    background: none; padding: 0; border-radius: 0;
+  }
+  .dt-body .shiki code { color: inherit; }
+  .dt-body pre.code-fallback code { color: #e0e0e0; }
+
+  kbd {
+    background:#141414; border:1px solid #2a2a2a; border-radius:4px;
+    padding:1px 5px; font-size:.7rem; font-family:inherit;
+  }
+</style>
+</head>
+<body class="bg-wt-bg text-wt-fg">
+<div id="root"></div>
+
+<script type="module">
+import { createHighlighter } from 'https://cdn.jsdelivr.net/npm/shiki@3.22.0/+esm'
+
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ---------------------------------------------------------------------------
+// TL;DR
+// ---------------------------------------------------------------------------
+const SUMMARY = "Codex 是一个多前端的编码智能体：CLI 入口把这次运行分发到交互式 TUI、无头 exec 或 app-server（供 IDE 与桌面端接入），三者最终都由同一套 SQ/EQ 协议驱动 core 的 Session。Session 的 Turn 循环负责组装历史、调用模型客户端，并把模型返回的工具调用交给工具路由执行，同时用自动压缩控制上下文窗口。所有命令在真正落地执行前，都必须穿过审批与沙箱这道护栏。";
+
+// ---------------------------------------------------------------------------
+// Diagram
+// ---------------------------------------------------------------------------
+const DIAGRAM = `graph TD
+  subgraph frontends["用户入口 Frontends"]
+    cliEntry["CLI 入口"]
+    tuiApp["交互式终端 UI"]
+    execRunner["无头执行模式"]
+    appServer["App Server"]
+  end
+
+  subgraph coresession["核心会话 Core Session"]
+    sessionTurn["Session 与 Turn 循环"]
+    protocol["SQ/EQ 会话协议"]
+    contextWindow["上下文自动压缩"]
+  end
+
+  subgraph modeltools["模型与工具 Model & Tools"]
+    modelClient["模型客户端"]
+    modelProvider["供应商与鉴权"]
+    toolRouter["工具路由与执行"]
+    mcpHub["MCP 外部工具"]
+  end
+
+  subgraph safety["安全护栏 Guardrails"]
+    guardGate["审批与沙箱护栏"]
+  end
+
+  cliEntry -->|"分发"| tuiApp
+  cliEntry -->|"分发"| execRunner
+  cliEntry -->|"分发"| appServer
+  tuiApp -->|"连接或内嵌"| appServer
+  appServer -->|"映射为会话操作"| sessionTurn
+  execRunner -->|"直接驱动"| sessionTurn
+  sessionTurn -->|"发出事件"| protocol
+  protocol -.->|"事件流"| tuiApp
+  sessionTurn -->|"调用模型"| modelClient
+  modelClient -->|"读取能力与凭证"| modelProvider
+  sessionTurn -->|"派发工具调用"| toolRouter
+  toolRouter -->|"先过闸门"| guardGate
+  toolRouter -->|"调用外部工具"| mcpHub
+  sessionTurn -->|"触发压缩"| contextWindow
+
+  classDef component fill:#a855f7,stroke:#c084fc,color:#fff
+  classDef composable fill:#7c3aed,stroke:#a78bfa,color:#fff
+  classDef utility fill:#6d28d9,stroke:#8b5cf6,color:#fff
+  classDef external fill:#525252,stroke:#737373,color:#fff
+  classDef data fill:#9333ea,stroke:#a855f7,color:#fff
+
+  class cliEntry,tuiApp,execRunner,appServer component
+  class sessionTurn,modelClient,toolRouter composable
+  class contextWindow,guardGate utility
+  class modelProvider,mcpHub external
+  class protocol data
+
+  click cliEntry nodeClickHandler "查看详情"
+  click tuiApp nodeClickHandler "查看详情"
+  click execRunner nodeClickHandler "查看详情"
+  click appServer nodeClickHandler "查看详情"
+  click sessionTurn nodeClickHandler "查看详情"
+  click protocol nodeClickHandler "查看详情"
+  click contextWindow nodeClickHandler "查看详情"
+  click modelClient nodeClickHandler "查看详情"
+  click modelProvider nodeClickHandler "查看详情"
+  click toolRouter nodeClickHandler "查看详情"
+  click mcpHub nodeClickHandler "查看详情"
+  click guardGate nodeClickHandler "查看详情"
+`;
+
+// ---------------------------------------------------------------------------
+// Node detail data
+// ---------------------------------------------------------------------------
+const NODES = {
+  cliEntry: {
+    title: "CLI 入口与命令分发",
+    description: "codex 二进制的唯一入口。它用 clap 声明全部子命令，并决定这次运行是进入交互式 TUI、无头 exec，还是拉起 app-server。没有被识别的选项会被转发给交互式 CLI。",
+    files: ["codex-rs/cli/src/main.rs:148"],
+    code: `enum Subcommand {
+    /// Run Codex non-interactively.
+    #[clap(visible_alias = "e")]
+    Exec(ExecCli),
+
+    /// [experimental] Run the app server or related tooling.
+    AppServer(AppServerCommand),
+}`,
+    lang: "rust",
+  },
+
+  tuiApp: {
+    title: "交互式终端 UI",
+    description: "默认的交互界面，一个全屏 Ratatui 应用，负责渲染对话流、审批提示和状态栏。它并不直接调用 core，而是通过 app-server 客户端接入——既可以是内嵌进程，也可以是本地 daemon。",
+    files: [
+      "codex-rs/tui/src/app_server_connection.rs:17",
+      "codex-rs/tui/src/app.rs:808",
+      "codex-rs/tui/src/chatwidget.rs",
+    ],
+    code: `pub(crate) async fn connect(target: &AppServerTarget) -> color_eyre::Result<AppServerClient> {
+    match target {
+        AppServerTarget::Embedded => {
+            color_eyre::eyre::bail!("embedded sessions have no remote connection")
+        }`,
+    lang: "rust",
+  },
+
+  execRunner: {
+    title: "无头执行模式",
+    description: "codex exec 的非交互运行路径，面向 CI、脚本和官方 SDK。它直接复用 core 的会话能力，并把事件流输出成 JSONL 或人类可读文本。",
+    files: [
+      "codex-rs/exec/src/lib.rs:259",
+      "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
+    ],
+    code: `pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
+    if let Err(err) = set_default_originator("codex_exec".to_string()) {
+        tracing::warn!(?err, "Failed to set codex exec originator override {err:?}");
+    }`,
+    lang: "rust",
+  },
+
+  appServer: {
+    title: "App Server（JSON-RPC 服务）",
+    description: "面向 IDE、桌面端和远程控制的瘦服务端，把 JSON-RPC 请求翻译成 core 的会话操作，再把事件流推回客户端。注意它并非严格的 JSON-RPC 2.0：收发双方都不带 jsonrpc 字段。",
+    files: [
+      "codex-rs/app-server/src/message_processor.rs:684",
+      "codex-rs/app-server-protocol/src/rpc.rs:1",
+      "codex-rs/app-server-protocol/src/protocol/",
+    ],
+    code: `pub(crate) async fn process_client_request(
+    self: &Arc<Self>,
+    connection_id: ConnectionId,
+    request: ClientRequest,
+    session: Arc<ConnectionSessionState>,
+    outbound_initialized: &AtomicBool,
+    cancellation: tokio_util::sync::CancellationToken,
+) {`,
+    lang: "rust",
+  },
+
+  sessionTurn: {
+    title: "Session 与 Turn 循环",
+    description: "系统的心脏。一个 Session 承载线程历史、配置与各种运行时服务；每个 Turn 则反复执行「准备输入 → 调模型 → 执行工具 → 再调模型」，直到模型不再要求后续动作。",
+    files: [
+      "codex-rs/core/src/session/turn.rs:163",
+      "codex-rs/core/src/session/turn.rs:423",
+      "codex-rs/core/src/tasks/regular.rs:34",
+    ],
+    code: `pub(crate) async fn run_turn(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    mut input: Vec<TurnInput>,
+    mcp_startup_requirements: &mut McpStartupRequirements,
+    prewarmed_client_session: Option<ModelClientSession>,
+    cancellation_token: CancellationToken,
+) -> CodexResult<Option<String>> {`,
+    lang: "rust",
+  },
+
+  protocol: {
+    title: "SQ/EQ 会话协议",
+    description: "Codex 内部一切通信的契约：客户端向 Submission Queue 投递 Op，后端向 Event Queue 回吐 EventMsg。所有前端本质上都只是这条事件流的消费者。",
+    files: [
+      "codex-rs/protocol/src/protocol.rs:600",
+      "codex-rs/protocol/src/protocol.rs:1357",
+      "codex-rs/protocol/src/protocol.rs:192",
+    ],
+    code: `pub enum Op {
+    /// Abort current task without terminating background terminal processes.
+    /// This server sends [\`EventMsg::TurnAborted\`] in response.
+    Interrupt,
+
+    /// Terminate all running background terminal processes for this thread.
+    CleanBackgroundTerminals,`,
+    lang: "rust",
+  },
+
+  contextWindow: {
+    title: "上下文窗口与自动压缩",
+    description: "持续统计 token 占用情况，在逼近上限时把历史压缩成摘要并替换会话历史，让长任务不会因为窗口溢出而中断。",
+    files: [
+      "codex-rs/core/src/session/context_window.rs:8",
+      "codex-rs/core/src/compact.rs:114",
+    ],
+    code: `pub(crate) struct ContextWindowTokenStatus {
+    pub(crate) active_context_tokens: i64,
+    pub(crate) auto_compact_scope_tokens: i64,
+    pub(crate) auto_compact_scope_limit: Option<i64>,
+    pub(crate) full_context_window_limit: Option<i64>,
+}`,
+    lang: "rust",
+  },
+
+  modelClient: {
+    title: "模型客户端",
+    description: "把会话历史组装成模型请求并流式读取响应。它依据 provider 声明的 wire_api 选择 Responses 或 Chat Completions 传输，并处理 WebSocket、重试与遥测。",
+    files: [
+      "codex-rs/core/src/client.rs:1971",
+      "codex-rs/core/src/client.rs:247",
+    ],
+    code: `let wire_api = self.client.state.provider.info().wire_api;
+match wire_api {
+    WireApi::Responses => {
+        if self.client.responses_websocket_enabled() {
+            let request_trace = current_span_w3c_trace_context();`,
+    lang: "rust",
+  },
+
+  modelProvider: {
+    title: "模型供应商与鉴权",
+    description: "描述每个后端的上限能力与鉴权方式，覆盖 OpenAI、Bedrock、Ollama、LM Studio 等。这些能力是供应商声明的天花板，配置只能在此基础上收窄，不能突破。",
+    files: [
+      "codex-rs/model-provider/src/provider.rs:59",
+      "codex-rs/model-provider-info/src/lib.rs",
+      "codex-rs/login/src/lib.rs",
+    ],
+    code: `pub struct ProviderCapabilities {
+    pub namespace_tools: bool,
+    pub image_generation: bool,
+    pub web_search: bool,
+    pub external_web_access: bool,
+    pub remote_compaction: RemoteCompactionSupport,
+}`,
+    lang: "rust",
+  },
+
+  toolRouter: {
+    title: "工具路由与执行",
+    description: "把模型返回的 tool call 映射到具体运行时：内建的 shell、apply_patch、文件搜索，以及可被发现的动态工具。它同时决定本轮哪些工具对模型可见。",
+    files: [
+      "codex-rs/core/src/tools/router.rs:52",
+      "codex-rs/core/src/tools/registry.rs:45",
+      "codex-rs/apply-patch/src/lib.rs",
+    ],
+    code: `pub struct ToolRouter {
+    registry: ToolRegistry,
+    model_visible_specs: Arc<[ToolSpec]>,
+    tool_mode: ToolMode,
+    code_mode_tool_names: BTreeMap<String, ToolName>,
+    tool_namespaces_info: Option<TurnToolNamespacesInfo>,`,
+    lang: "rust",
+  },
+
+  mcpHub: {
+    title: "MCP 外部工具接入",
+    description: "以 Model Context Protocol 连接外部服务器（stdio 或 streamable HTTP），把对端工具挂进同一个工具目录，并处理 OAuth 登录与工具级审批。",
+    files: [
+      "codex-rs/codex-mcp/src/connection_manager.rs:940",
+      "codex-rs/rmcp-client/src/rmcp_client.rs",
+      "codex-rs/codex-mcp/src/tool_catalog_cache.rs",
+    ],
+    code: `pub async fn call_tool(
+    &self,
+    server: &str,
+    tool: &str,
+    environment_id: Option<&str>,
+    arguments: Option<serde_json::Value>,
+    mut meta: Option<serde_json::Value>,
+    requested_timeout: Option<Duration>,
+    wait_for_server: bool,
+) -> Result<CallToolResult> {`,
+    lang: "rust",
+  },
+
+  guardGate: {
+    title: "审批与沙箱护栏",
+    description: "每条命令在真正执行前要穿过三道关卡：execpolicy 规则给出 allow / prompt / forbidden 判定；需要时向用户请求审批；最后在平台沙箱内启动进程（Linux Landlock、macOS Seatbelt、Windows 沙箱）。",
+    files: [
+      "codex-rs/execpolicy/src/decision.rs:9",
+      "codex-rs/core/src/tools/approvals.rs:467",
+      "codex-rs/sandboxing/src/manager.rs:42",
+      "codex-rs/protocol/src/protocol.rs:1071",
+    ],
+    code: `pub enum Decision {
+    /// Command may run without further approval.
+    Allow,
+    /// Request explicit user approval; rejected outright when running with \`approval_policy="never"\`.
+    Prompt,
+    /// Command is blocked without further consideration.
+    Forbidden,
+}`,
+    lang: "rust",
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Legend
+// ---------------------------------------------------------------------------
+const LEGEND = [
+  { label: '用户入口组件', color: 'bg-node-component' },
+  { label: '核心编排', color: 'bg-node-composable' },
+  { label: '底层工具', color: 'bg-node-utility' },
+  { label: '外部依赖', color: 'bg-node-external' },
+  { label: '协议数据', color: 'bg-node-data' },
+];
+
+// ---------------------------------------------------------------------------
+// Shiki pre-highlight
+// ---------------------------------------------------------------------------
+const langs = [...new Set(Object.values(NODES).map(n => n.lang).filter(Boolean))];
+if (langs.length === 0) langs.push('rust');
+let highlighter = null;
+try { highlighter = await createHighlighter({ themes: ['vitesse-dark'], langs }); }
+catch (e) { console.warn('Shiki failed:', e); }
+const HIGHLIGHTED = {};
+for (const [id, node] of Object.entries(NODES)) {
+  if (node.code && highlighter) {
+    try {
+      HIGHLIGHTED[id] = highlighter.codeToHtml(node.code, { lang: node.lang || 'rust', theme: 'vitesse-dark' });
+    } catch (e) { console.warn(`Highlight failed for ${id}:`, e); }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// usePanZoom
+// ---------------------------------------------------------------------------
+function usePanZoom() {
+  const viewportRef = useRef(null), canvasRef = useRef(null), zoomDisplayRef = useRef(null);
+  const st = useRef({ zoom: 1, panX: 0, panY: 0 });
+  const drag = useRef({ on: false, lx: 0, ly: 0 });
+
+  const apply = useCallback(() => {
+    const { zoom, panX, panY } = st.current;
+    if (canvasRef.current)
+      canvasRef.current.style.transform = `translate(${panX}px,${panY}px) scale(${zoom})`;
+    if (zoomDisplayRef.current)
+      zoomDisplayRef.current.textContent = Math.round(zoom * 100) + '%';
+  }, []);
+
+  const fitToScreen = useCallback(() => {
+    const svg = canvasRef.current?.querySelector('svg');
+    const vp = viewportRef.current;
+    if (!svg || !vp) return;
+    const s = st.current;
+    const vw = vp.clientWidth, vh = vp.clientHeight;
+    const sw = svg.getBoundingClientRect().width / s.zoom;
+    const sh = svg.getBoundingClientRect().height / s.zoom;
+    if (!sw || !sh) return;
+    const fit = Math.max(0.15, Math.min(2, Math.min((vw - 80) / sw, (vh - 80) / sh)));
+    s.zoom = fit; s.panX = (vw - sw * fit) / 2; s.panY = (vh - sh * fit) / 2;
+    apply();
+  }, [apply]);
+
+  useEffect(() => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const onWheel = (e) => {
+      e.preventDefault();
+      const r = vp.getBoundingClientRect();
+      const mx = e.clientX - r.left, my = e.clientY - r.top, s = st.current;
+      const f = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      const nz = Math.min(4, Math.max(0.15, s.zoom * f)), sc = nz / s.zoom;
+      s.panX = mx - sc * (mx - s.panX); s.panY = my - sc * (my - s.panY); s.zoom = nz;
+      apply();
+    };
+    const onDown = (e) => {
+      if (e.target.closest('.node')) return;
+      drag.current = { on: true, lx: e.clientX, ly: e.clientY };
+      vp.setPointerCapture(e.pointerId);
+    };
+    const onMove = (e) => {
+      const d = drag.current; if (!d.on) return;
+      st.current.panX += e.clientX - d.lx; st.current.panY += e.clientY - d.ly;
+      d.lx = e.clientX; d.ly = e.clientY; apply();
+    };
+    const onUp = () => { drag.current.on = false; };
+    vp.addEventListener('wheel', onWheel, { passive: false });
+    vp.addEventListener('pointerdown', onDown);
+    vp.addEventListener('pointermove', onMove);
+    vp.addEventListener('pointerup', onUp);
+    vp.addEventListener('pointercancel', onUp);
+    window.addEventListener('resize', fitToScreen);
+    return () => {
+      vp.removeEventListener('wheel', onWheel);
+      vp.removeEventListener('pointerdown', onDown);
+      vp.removeEventListener('pointermove', onMove);
+      vp.removeEventListener('pointerup', onUp);
+      vp.removeEventListener('pointercancel', onUp);
+      window.removeEventListener('resize', fitToScreen);
+    };
+  }, [apply, fitToScreen]);
+
+  const zoomIn = useCallback(() => { st.current.zoom = Math.min(4, st.current.zoom * 1.25); apply(); }, [apply]);
+  const zoomOut = useCallback(() => { st.current.zoom = Math.max(0.15, st.current.zoom / 1.25); apply(); }, [apply]);
+  return { viewportRef, canvasRef, zoomDisplayRef, zoomIn, zoomOut, fitToScreen };
+}
+
+// ---------------------------------------------------------------------------
+// MermaidDiagram
+// ---------------------------------------------------------------------------
+function MermaidDiagram({ onNodeClick }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    window.nodeClickHandler = onNodeClick;
+    mermaid.initialize({
+      startOnLoad: false, theme: 'dark', securityLevel: 'loose',
+      themeVariables: {
+        primaryColor: '#0a0a0a', primaryTextColor: '#ffffff', primaryBorderColor: '#2a2a2a',
+        lineColor: '#a0a0a0', background: '#000000',
+        secondaryColor: '#000000', tertiaryColor: '#000000',
+        mainBkg: '#0a0a0a', nodeBorder: '#2a2a2a',
+        clusterBkg: 'rgba(10,10,10,0.8)', clusterBorder: '#7c3aed',
+        titleColor: '#ffffff', edgeLabelBackground: 'transparent',
+      },
+      flowchart: { useMaxWidth: false, htmlLabels: true, curve: 'basis' },
+    });
+    mermaid.render('walkthrough-diagram', DIAGRAM).then(({ svg, bindFunctions }) => {
+      if (ref.current) { ref.current.innerHTML = svg; bindFunctions?.(ref.current); }
+    }).catch(e => console.error('Mermaid render failed:', e));
+    return () => { delete window.nodeClickHandler; };
+  }, [onNodeClick]);
+  return React.createElement('div', { ref, className: 'mermaid-wrap' });
+}
+
+// ---------------------------------------------------------------------------
+// Summary (accordion, collapsed by default)
+// ---------------------------------------------------------------------------
+function Summary({ collapsed, onToggle }) {
+  if (collapsed) {
+    return React.createElement('div', {
+      onClick: onToggle,
+      className: 'fixed top-16 left-6 z-10 px-3 py-1.5 bg-wt-surface/60 backdrop-blur border border-wt-border rounded-full shadow-lg cursor-pointer hover:bg-wt-surface/80 transition-all duration-300',
+    }, React.createElement('span', { className: 'text-xs text-wt-muted font-medium' }, 'ℹ︎ 总览'));
+  }
+  return React.createElement('div', {
+    onClick: onToggle,
+    className: 'fixed top-16 left-6 z-10 max-w-lg px-4 py-3 bg-wt-surface/80 backdrop-blur border border-wt-border rounded-lg shadow-lg cursor-pointer transition-all duration-300',
+  },
+    React.createElement('p', { className: 'text-sm text-wt-muted leading-relaxed' }, SUMMARY),
+    React.createElement('p', { className: 'text-[0.65rem] text-wt-muted/50 mt-1.5' }, '点击收起')
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DetailPanel
+// ---------------------------------------------------------------------------
+function DetailPanel({ nodeId, node, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  const codeHtml = HIGHLIGHTED[nodeId];
+  return React.createElement('div', {
+    className: 'fixed top-4 right-4 bottom-4 w-[560px] max-w-[calc(100vw-2rem)] z-30 bg-wt-surface border border-wt-border rounded-xl shadow-2xl flex flex-col overflow-hidden',
+  },
+    React.createElement('button', {
+      onClick: onClose,
+      className: 'absolute top-3 right-3 z-10 w-7 h-7 rounded-md border border-wt-border bg-wt-raised text-wt-muted flex items-center justify-center text-lg hover:bg-wt-red hover:border-wt-red hover:text-white transition-colors',
+    }, '×'),
+    React.createElement('div', { className: 'flex-1 overflow-y-auto p-5' },
+      React.createElement('h2', { className: 'text-lg font-bold text-wt-fg mb-3 pr-9' }, node.title),
+      React.createElement('div', { className: 'dt-body' }, React.createElement('p', null, node.description)),
+      node.code && React.createElement('div', { className: 'dt-body' },
+        codeHtml
+          ? React.createElement('div', { dangerouslySetInnerHTML: { __html: codeHtml } })
+          : React.createElement('pre', { className: 'code-fallback' }, React.createElement('code', null, node.code))
+      ),
+      node.files && node.files.length > 0 && React.createElement('div', { className: 'mt-4 pt-3 border-t border-wt-border' },
+        React.createElement('div', { className: 'text-[0.7rem] uppercase tracking-wider text-wt-muted font-semibold mb-1.5' }, 'Files'),
+        React.createElement('code', { className: 'text-sm text-wt-file font-mono leading-relaxed' },
+          node.files.map((f, i) => React.createElement('span', { key: i }, f, React.createElement('br')))
+        )
+      )
+    )
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ZoomControls
+// ---------------------------------------------------------------------------
+function ZoomControls({ zoomDisplayRef, onZoomIn, onZoomOut, onFit }) {
+  const btn = 'w-8 h-8 rounded-md border border-wt-border bg-wt-surface text-wt-fg flex items-center justify-center hover:bg-wt-raised transition-colors text-base leading-none';
+  return React.createElement('div', {
+    className: 'fixed bottom-5 left-5 z-20 flex items-center gap-2 px-2 py-1.5 bg-wt-surface/80 backdrop-blur border border-wt-border rounded-lg shadow-xl',
+  },
+    React.createElement('button', { className: btn, onClick: onZoomOut, title: 'Zoom out' }, '−'),
+    React.createElement('span', { ref: zoomDisplayRef, className: 'text-xs text-wt-muted w-12 text-center tabular-nums' }, '100%'),
+    React.createElement('button', { className: btn, onClick: onZoomIn, title: 'Zoom in' }, '+'),
+    React.createElement('button', { className: btn + ' ml-1 text-[0.7rem]', onClick: onFit, title: 'Fit to screen' }, 'Fit')
+  );
+}
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+function App() {
+  const [activeId, _setActiveId] = useState(null);
+  const [summaryCollapsed, setSummaryCollapsed] = useState(true);
+  const pz = usePanZoom();
+
+  const setActiveNode = useCallback((nodeId) => {
+    _setActiveId(nodeId);
+    document.querySelectorAll('.mermaid-wrap .node').forEach(n => { n.style.opacity = nodeId ? '0.4' : '1'; });
+    if (nodeId) {
+      const el = document.querySelector(`.mermaid-wrap .node[id*="${nodeId}"]`);
+      if (el) el.style.opacity = '1';
+    }
+  }, []);
+
+  const closeDetail = useCallback(() => {
+    _setActiveId(null);
+    document.querySelectorAll('.mermaid-wrap .node').forEach(n => { n.style.opacity = '1'; });
+  }, []);
+
+  useEffect(() => { setTimeout(pz.fitToScreen, 600); }, [pz.fitToScreen]);
+
+  return React.createElement(React.Fragment, null,
+    React.createElement('header', {
+      className: 'fixed top-0 inset-x-0 z-10 px-6 py-3.5 bg-gradient-to-b from-wt-bg to-transparent pointer-events-none',
+    },
+      React.createElement('h1', { className: 'text-base font-semibold text-wt-fg' }, 'Codex 架构总览'),
+      React.createElement('p', { className: 'text-sm text-wt-muted mt-0.5' }, '从 CLI 入口、Turn 循环到模型调用与沙箱执行的完整链路')
+    ),
+    React.createElement(Summary, { collapsed: summaryCollapsed, onToggle: () => setSummaryCollapsed(c => !c) }),
+    React.createElement('div', { ref: pz.viewportRef, className: 'w-full h-screen overflow-hidden cursor-grab active:cursor-grabbing' },
+      React.createElement('div', { ref: pz.canvasRef, className: 'origin-top-left will-change-transform inline-block p-[80px_60px_60px]' },
+        React.createElement(MermaidDiagram, { onNodeClick: setActiveNode })
+      )
+    ),
+    React.createElement(ZoomControls, {
+      zoomDisplayRef: pz.zoomDisplayRef, onZoomIn: pz.zoomIn, onZoomOut: pz.zoomOut, onFit: pz.fitToScreen,
+    }),
+    React.createElement('div', {
+      className: 'fixed bottom-5 left-1/2 -translate-x-1/2 z-20 flex gap-4 px-4 py-2 bg-wt-surface border border-wt-border rounded-lg shadow-xl',
+    }, LEGEND.map(l => React.createElement('span', { key: l.label, className: 'flex items-center gap-1.5 text-xs text-wt-muted' },
+      React.createElement('span', { className: `w-2 h-2 rounded-full ${l.color}` }), l.label
+    ))),
+    activeId && NODES[activeId] && React.createElement(DetailPanel, { nodeId: activeId, node: NODES[activeId], onClose: closeDetail }),
+    React.createElement('div', { className: 'fixed bottom-5 right-5 z-20 text-xs text-wt-muted opacity-50' },
+      React.createElement('kbd', null, '滚轮'), ' 缩放 · ',
+      React.createElement('kbd', null, '拖拽'), ' 平移 · ',
+      '点击节点看详情'
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>

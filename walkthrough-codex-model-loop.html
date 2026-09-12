@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="zh-CN" style="color-scheme: dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Codex：模型 JSON 之后发生了什么</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: { extend: { colors: {
+      wt: {
+        bg: '#000000', surface: '#0a0a0a', raised: '#141414',
+        border: '#2a2a2a', fg: '#ffffff', muted: '#a0a0a0',
+        accent: '#a855f7', file: '#c084fc', red: '#ef4444',
+      },
+      node: {
+        component: '#a855f7', composable: '#7c3aed', utility: '#6d28d9',
+        external: '#525252', event: '#d8b4fe', data: '#9333ea',
+      },
+    }}},
+  };
+</script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  body { background: #000; }
+  .mermaid-wrap svg { max-width: none !important; height: auto !important; }
+
+  .mermaid-wrap .node { cursor: pointer; }
+  .mermaid-wrap .node:hover rect,
+  .mermaid-wrap .node:hover polygon,
+  .mermaid-wrap .node:hover circle,
+  .mermaid-wrap .node:hover .label-container { filter: brightness(1.3); transition: filter .15s; }
+
+  .dt-body p { color:#a0a0a0; font-size:.88rem; line-height:1.65; margin-bottom:10px; }
+  .dt-body p code {
+    background:rgba(168,85,247,.12); padding:1px 6px; border-radius:4px;
+    font-family:'SF Mono','Fira Code',monospace; font-size:.82rem; color:#c084fc;
+  }
+
+  .dt-body .shiki, .dt-body pre.code-fallback {
+    background: #000000; border: 1px solid #2a2a2a; border-radius: 8px;
+    padding: 14px 16px; overflow-x: auto; margin: 8px 0 14px;
+  }
+  .dt-body .shiki { background: #000000 !important; }
+  .dt-body .shiki code, .dt-body pre.code-fallback code {
+    font-family: 'SF Mono','Fira Code',monospace; font-size: .78rem; line-height: 1.55;
+    background: none; padding: 0; border-radius: 0;
+  }
+  .dt-body .shiki code { color: inherit; }
+  .dt-body pre.code-fallback code { color: #e0e0e0; }
+
+  kbd {
+    background:#141414; border:1px solid #2a2a2a; border-radius:4px;
+    padding:1px 5px; font-size:.7rem; font-family:inherit;
+  }
+</style>
+</head>
+<body class="bg-wt-bg text-wt-fg">
+<div id="root"></div>
+
+<script type="module">
+import { createHighlighter } from 'https://cdn.jsdelivr.net/npm/shiki@3.22.0/+esm'
+
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ---------------------------------------------------------------------------
+// TL;DR
+// ---------------------------------------------------------------------------
+const SUMMARY = "模型端按 SSE 或 WebSocket 推回事件流，ModelClient 把它解析成强类型的 ResponseItem，再由流消费循环逐项交给 handle_output_item_done。这唯一一个函数就是岔路口：一旦 item 能被解析成工具调用就排队执行工具，否则收尾成 TurnItem 直接回答——而 spawn_agent 之所以能派生子代理，只是因为它恰好也是一个普通工具。三条出路的结果都会写回对话历史，最后由 needs_follow_up 决定是再发一次模型请求，还是结束这一轮。";
+
+// ---------------------------------------------------------------------------
+// Diagram
+// ---------------------------------------------------------------------------
+const DIAGRAM = `graph TD
+  subgraph modelside["1 模型端 Model Side"]
+    modelStream["模型端响应流"]
+    responseItem["归一化响应项"]
+  end
+
+  subgraph dispatch["2 Harness 分诊 Dispatch"]
+    streamLoop["流消费循环"]
+    itemDispatcher["分发岔路口"]
+    toolClassifier["工具调用识别"]
+  end
+
+  subgraph branches["3 三条出路 Three Branches"]
+    toolRuntime["其一 执行工具"]
+    answerPath["其二 直接回答"]
+    spawnAgent["其三 派生子代理"]
+  end
+
+  subgraph feedback["4 回灌 Feed Back"]
+    recordHistory["结果写回历史"]
+    needsFollowUp["循环闸门"]
+  end
+
+  turnExit["Turn 收尾"]
+
+  modelStream -->|"SSE / WebSocket 事件"| responseItem
+  responseItem -->|"OutputItemDone"| streamLoop
+  streamLoop -->|"逐项处理"| itemDispatcher
+  itemDispatcher -->|"先试工具"| toolClassifier
+  toolClassifier -->|"FunctionCall / CustomToolCall"| toolRuntime
+  toolClassifier -.->|"其余 item"| answerPath
+  toolRuntime -->|"命中 spawn_agent"| spawnAgent
+  toolRuntime -->|"工具结果"| recordHistory
+  spawnAgent -->|"子线程结果"| recordHistory
+  answerPath -->|"last_agent_message"| recordHistory
+  recordHistory -->|"历史已更新"| needsFollowUp
+  needsFollowUp ==>|"true：再发一次模型请求"| streamLoop
+  needsFollowUp -->|"false"| turnExit
+
+  classDef external fill:#525252,stroke:#737373,color:#fff
+  classDef data fill:#9333ea,stroke:#a855f7,color:#fff
+  classDef composable fill:#7c3aed,stroke:#a78bfa,color:#fff
+  classDef utility fill:#6d28d9,stroke:#8b5cf6,color:#fff
+  classDef event fill:#d8b4fe,stroke:#e9d5ff,color:#000
+
+  class modelStream external
+  class responseItem,recordHistory data
+  class streamLoop,itemDispatcher,toolRuntime,answerPath,spawnAgent composable
+  class toolClassifier,needsFollowUp utility
+  class turnExit event
+
+  click modelStream nodeClickHandler "查看详情"
+  click responseItem nodeClickHandler "查看详情"
+  click streamLoop nodeClickHandler "查看详情"
+  click itemDispatcher nodeClickHandler "查看详情"
+  click toolClassifier nodeClickHandler "查看详情"
+  click toolRuntime nodeClickHandler "查看详情"
+  click answerPath nodeClickHandler "查看详情"
+  click spawnAgent nodeClickHandler "查看详情"
+  click recordHistory nodeClickHandler "查看详情"
+  click needsFollowUp nodeClickHandler "查看详情"
+  click turnExit nodeClickHandler "查看详情"
+`;
+
+// ---------------------------------------------------------------------------
+// Node detail data
+// ---------------------------------------------------------------------------
+const NODES = {
+  modelStream: {
+    title: "模型端响应流",
+    description: "模型端以 SSE（或 WebSocket）推回事件序列，ModelClient::stream 依据 provider 声明的 wire_api 选择传输并把它解析成强类型事件。harness 真正在意的是两类：OutputItemAdded（某项开始产出）和 OutputItemDone（该项已完成，可以动手处理）。",
+    files: [
+      "codex-rs/codex-api/src/common.rs:80",
+      "codex-rs/core/src/client.rs:1971",
+    ],
+    code: `pub enum ResponseEvent {
+    Created {
+        /// Existing server response ID, when supplied by the stream.
+        response_id: Option<String>,
+    },
+    SafetyBuffering(SafetyBuffering),
+    OutputItemDone(ResponseItem),
+    OutputItemAdded(ResponseItem),`,
+    lang: "rust",
+  },
+
+  responseItem: {
+    title: "归一化响应项",
+    description: "模型的所有输出最终都被归一化成 ResponseItem：Message、Reasoning、FunctionCall、LocalShellCall、CustomToolCall、WebSearchCall 等等。harness 只对其中少数几种动手，其余纯粹作为历史留存。注意 FunctionCall 的 arguments 是字符串形式的 JSON，被刻意保留为未解析状态。",
+    files: [
+      "codex-rs/protocol/src/models.rs:999",
+      "codex-rs/protocol/src/models.rs:1061",
+    ],
+    code: `// The Responses API returns the function call arguments as a *string* that contains
+// JSON, not as an already‑parsed object. We keep it as a raw string here and let
+// Session::handle_function_call parse it into a Value.
+arguments: String,
+#[serde(default, skip_serializing_if = "Option::is_none")]
+#[ts(optional)]
+encrypted_function_args: Option<Vec<String>>,
+call_id: String,`,
+    lang: "rust",
+  },
+
+  streamLoop: {
+    title: "流消费循环",
+    description: "逐个事件地消费响应流，把每个已完成的 item 交给分发器。工具调用不会被阻塞等待——它们被包成 future 推进 FuturesOrdered，因此同一轮响应里的多个工具可以并发执行。",
+    files: [
+      "codex-rs/core/src/session/turn.rs:2478",
+      "codex-rs/core/src/session/turn.rs:2487",
+    ],
+    code: `let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
+let mut needs_follow_up = false;
+let mut last_agent_message: Option<String> = None;`,
+    lang: "rust",
+  },
+
+  itemDispatcher: {
+    title: "分发岔路口",
+    description: "handle_output_item_done 是整个 harness 唯一的岔路口。它先把 item 当工具调用试一遍：成功就记录并排队执行工具，同时把 needs_follow_up 置为 true；不匹配就走普通输出路径，把结果收尾成 TurnItem 推给前端。",
+    files: [
+      "codex-rs/core/src/stream_events_utils.rs:300",
+    ],
+    code: `pub(crate) async fn handle_output_item_done(
+    ctx: &mut HandleOutputCtx,
+    item: ResponseItem,
+    previously_active_item: Option<TurnItem>,
+) -> Result<OutputItemResult> {
+    let mut output = OutputItemResult::default();
+    let plan_mode = ctx.step_context.turn.mode() == ModeKind::Plan;
+
+    match ToolRouter::build_tool_call(item.clone()) {`,
+    lang: "rust",
+  },
+
+  toolClassifier: {
+    title: "工具调用识别",
+    description: "build_tool_call 只认三种 item：FunctionCall（常规工具）、CustomToolCall（自定义 / 代码模式）、以及 execution 为 client 的 ToolSearchCall。其余一切——包括服务端执行的工具搜索——都落到最后的兜底分支返回 None，转到回答路径。",
+    files: [
+      "codex-rs/core/src/tools/router.rs:244",
+    ],
+    code: `            ResponseItem::CustomToolCall {
+                name,
+                namespace,
+                input,
+                call_id,
+                ..
+            } => Ok(Some(ToolCall {
+                tool_name: ToolName::new(namespace, name).with_default_namespace(),
+                call_id,
+                payload: ToolPayload::Custom { input },
+                encrypted_function_args: None,
+            })),
+            _ => Ok(None),`,
+    lang: "rust",
+  },
+
+  toolRuntime: {
+    title: "出路其一：执行工具",
+    description: "拿到 ToolCall 后交给对应 runtime：查询该工具是否支持并发、取出执行器、跑审批与沙箱、最后把结果包成 ResponseItem 回灌。注意非致命错误不会被抛出——它们被包装成工具输出还给模型，让模型自己纠正。",
+    files: [
+      "codex-rs/core/src/tools/parallel.rs:97",
+      "codex-rs/core/src/tools/parallel.rs:75",
+    ],
+    code: `    pub(crate) fn handle_tool_call_with_source(
+        self,
+        step_context: Arc<StepContext>,
+        call: ToolCall,
+        source: ToolCallSource,
+        cancellation_token: CancellationToken,
+    ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
+        self.session
+            .services
+            .executed_tool_calls
+            .record_tool_call(&call, &source, &step_context);`,
+    lang: "rust",
+  },
+
+  answerPath: {
+    title: "出路其二：直接回答 / 推理",
+    description: "非工具 item 走这里：Message、Reasoning、AgentMessage 等被收尾成 TurnItem 推给前端渲染。如果它是助手正文，还会被记为 last_agent_message——也就是整个 turn 最终交给调用方的产出。",
+    files: [
+      "codex-rs/core/src/stream_events_utils.rs:255",
+      "codex-rs/core/src/stream_events_utils.rs:390",
+    ],
+    code: `pub(crate) async fn finalize_non_tool_response_item(
+    sess: &Session,
+    contributor_policy: TurnItemContributorPolicy<'_>,
+    item: &ResponseItem,
+    plan_mode: bool,
+) -> Option<FinalizedTurnItem> {
+    let turn_item =
+        handle_non_tool_response_item(sess, contributor_policy, item, plan_mode).await?;`,
+    lang: "rust",
+  },
+
+  spawnAgent: {
+    title: "出路其三：派生子代理",
+    description: "关键洞察——子代理不是特殊通道。spawn_agent 就是一个普通 ToolExecutor，和 shell、apply_patch 平级，区别只在于它新建了一个完整的 Codex 线程（拥有自己的 Session 与历史）。线程深度上限防止无限套娃，父代理随后用 wait 工具取回结果。",
+    files: [
+      "codex-rs/core/src/tools/handlers/multi_agents/spawn.rs:23",
+      "codex-rs/core/src/tools/handlers/multi_agents/spawn.rs:47",
+      "codex-rs/core/src/agent/control/spawn.rs:263",
+      "codex-rs/core/src/tools/handlers/multi_agents/wait.rs:55",
+    ],
+    code: `impl ToolExecutor<ToolInvocation> for Handler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::namespaced(MULTI_AGENT_V1_NAMESPACE, "spawn_agent")
+    }`,
+    lang: "rust",
+  },
+
+  recordHistory: {
+    title: "结果写回历史",
+    description: "无论走哪条出路，结果都会先落进对话历史并持久化到 rollout。这意味着 harness 的「记忆」本质上就是对历史的持续追加——下一次模型请求要发的就是这个累积后的历史。",
+    files: [
+      "codex-rs/core/src/stream_events_utils.rs:80",
+      "codex-rs/core/src/session/mod.rs:3509",
+    ],
+    code: `pub(crate) async fn record_completed_response_item(
+    sess: &Session,
+    step_context: &StepContext,
+    item: &ResponseItem,
+) {
+    record_completed_response_item_with_finalized_facts(
+        sess,
+        step_context,
+        item,
+        /*finalized_facts*/ None,
+    )
+    .await;
+}`,
+    lang: "rust",
+  },
+
+  needsFollowUp: {
+    title: "循环闸门",
+    description: "agent loop 的终止条件就在这里：模型要求后续动作（本轮有工具调用）或用户中途插了话，就再发一次模型请求；否则本轮对话产出即为终态。",
+    files: [
+      "codex-rs/core/src/session/turn.rs:565",
+      "codex-rs/core/src/session/turn.rs:536",
+    ],
+    code: `let needs_follow_up = model_needs_follow_up || has_pending_input;
+let token_limit_reached = token_status.token_limit_reached;`,
+    lang: "rust",
+  },
+
+  turnExit: {
+    title: "Turn 收尾",
+    description: "没有新的待处理输入时，任务返回、本轮结束，harness 回到等待状态。最终消息交给调用方：TUI 渲染、exec 输出 JSONL、app-server 推给已连接的客户端。",
+    files: [
+      "codex-rs/core/src/tasks/regular.rs:91",
+      "codex-rs/core/src/tasks/regular.rs:34",
+    ],
+    code: `                if !sess.input_queue.has_pending_input(&sess.active_turn).await {
+                    return Ok(last_agent_message);
+                }`,
+    lang: "rust",
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Legend
+// ---------------------------------------------------------------------------
+const LEGEND = [
+  { label: '模型端 / 外部', color: 'bg-node-external' },
+  { label: '数据结构', color: 'bg-node-data' },
+  { label: 'Harness 编排', color: 'bg-node-composable' },
+  { label: '判定逻辑', color: 'bg-node-utility' },
+  { label: '状态终点', color: 'bg-node-event' },
+];
+
+// ---------------------------------------------------------------------------
+// Shiki pre-highlight
+// ---------------------------------------------------------------------------
+const langs = [...new Set(Object.values(NODES).map(n => n.lang).filter(Boolean))];
+if (langs.length === 0) langs.push('rust');
+let highlighter = null;
+try { highlighter = await createHighlighter({ themes: ['vitesse-dark'], langs }); }
+catch (e) { console.warn('Shiki failed:', e); }
+const HIGHLIGHTED = {};
+for (const [id, node] of Object.entries(NODES)) {
+  if (node.code && highlighter) {
+    try {
+      HIGHLIGHTED[id] = highlighter.codeToHtml(node.code, { lang: node.lang || 'rust', theme: 'vitesse-dark' });
+    } catch (e) { console.warn(`Highlight failed for ${id}:`, e); }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// usePanZoom
+// ---------------------------------------------------------------------------
+function usePanZoom() {
+  const viewportRef = useRef(null), canvasRef = useRef(null), zoomDisplayRef = useRef(null);
+  const st = useRef({ zoom: 1, panX: 0, panY: 0 });
+  const drag = useRef({ on: false, lx: 0, ly: 0 });
+
+  const apply = useCallback(() => {
+    const { zoom, panX, panY } = st.current;
+    if (canvasRef.current)
+      canvasRef.current.style.transform = `translate(${panX}px,${panY}px) scale(${zoom})`;
+    if (zoomDisplayRef.current)
+      zoomDisplayRef.current.textContent = Math.round(zoom * 100) + '%';
+  }, []);
+
+  const fitToScreen = useCallback(() => {
+    const svg = canvasRef.current?.querySelector('svg');
+    const vp = viewportRef.current;
+    if (!svg || !vp) return;
+    const s = st.current;
+    const vw = vp.clientWidth, vh = vp.clientHeight;
+    const sw = svg.getBoundingClientRect().width / s.zoom;
+    const sh = svg.getBoundingClientRect().height / s.zoom;
+    if (!sw || !sh) return;
+    const fit = Math.max(0.15, Math.min(2, Math.min((vw - 80) / sw, (vh - 80) / sh)));
+    s.zoom = fit; s.panX = (vw - sw * fit) / 2; s.panY = (vh - sh * fit) / 2;
+    apply();
+  }, [apply]);
+
+  useEffect(() => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const onWheel = (e) => {
+      e.preventDefault();
+      const r = vp.getBoundingClientRect();
+      const mx = e.clientX - r.left, my = e.clientY - r.top, s = st.current;
+      const f = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      const nz = Math.min(4, Math.max(0.15, s.zoom * f)), sc = nz / s.zoom;
+      s.panX = mx - sc * (mx - s.panX); s.panY = my - sc * (my - s.panY); s.zoom = nz;
+      apply();
+    };
+    const onDown = (e) => {
+      if (e.target.closest('.node')) return;
+      drag.current = { on: true, lx: e.clientX, ly: e.clientY };
+      vp.setPointerCapture(e.pointerId);
+    };
+    const onMove = (e) => {
+      const d = drag.current; if (!d.on) return;
+      st.current.panX += e.clientX - d.lx; st.current.panY += e.clientY - d.ly;
+      d.lx = e.clientX; d.ly = e.clientY; apply();
+    };
+    const onUp = () => { drag.current.on = false; };
+    vp.addEventListener('wheel', onWheel, { passive: false });
+    vp.addEventListener('pointerdown', onDown);
+    vp.addEventListener('pointermove', onMove);
+    vp.addEventListener('pointerup', onUp);
+    vp.addEventListener('pointercancel', onUp);
+    window.addEventListener('resize', fitToScreen);
+    return () => {
+      vp.removeEventListener('wheel', onWheel);
+      vp.removeEventListener('pointerdown', onDown);
+      vp.removeEventListener('pointermove', onMove);
+      vp.removeEventListener('pointerup', onUp);
+      vp.removeEventListener('pointercancel', onUp);
+      window.removeEventListener('resize', fitToScreen);
+    };
+  }, [apply, fitToScreen]);
+
+  const zoomIn = useCallback(() => { st.current.zoom = Math.min(4, st.current.zoom * 1.25); apply(); }, [apply]);
+  const zoomOut = useCallback(() => { st.current.zoom = Math.max(0.15, st.current.zoom / 1.25); apply(); }, [apply]);
+  return { viewportRef, canvasRef, zoomDisplayRef, zoomIn, zoomOut, fitToScreen };
+}
+
+// ---------------------------------------------------------------------------
+// MermaidDiagram
+// ---------------------------------------------------------------------------
+function MermaidDiagram({ onNodeClick }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    window.nodeClickHandler = onNodeClick;
+    mermaid.initialize({
+      startOnLoad: false, theme: 'dark', securityLevel: 'loose',
+      themeVariables: {
+        primaryColor: '#0a0a0a', primaryTextColor: '#ffffff', primaryBorderColor: '#2a2a2a',
+        lineColor: '#a0a0a0', background: '#000000',
+        secondaryColor: '#000000', tertiaryColor: '#000000',
+        mainBkg: '#0a0a0a', nodeBorder: '#2a2a2a',
+        clusterBkg: 'rgba(10,10,10,0.8)', clusterBorder: '#7c3aed',
+        titleColor: '#ffffff', edgeLabelBackground: 'transparent',
+      },
+      flowchart: { useMaxWidth: false, htmlLabels: true, curve: 'basis' },
+    });
+    mermaid.render('walkthrough-diagram', DIAGRAM).then(({ svg, bindFunctions }) => {
+      if (ref.current) { ref.current.innerHTML = svg; bindFunctions?.(ref.current); }
+    }).catch(e => console.error('Mermaid render failed:', e));
+    return () => { delete window.nodeClickHandler; };
+  }, [onNodeClick]);
+  return React.createElement('div', { ref, className: 'mermaid-wrap' });
+}
+
+// ---------------------------------------------------------------------------
+// Summary (accordion, collapsed by default)
+// ---------------------------------------------------------------------------
+function Summary({ collapsed, onToggle }) {
+  if (collapsed) {
+    return React.createElement('div', {
+      onClick: onToggle,
+      className: 'fixed top-16 left-6 z-10 px-3 py-1.5 bg-wt-surface/60 backdrop-blur border border-wt-border rounded-full shadow-lg cursor-pointer hover:bg-wt-surface/80 transition-all duration-300',
+    }, React.createElement('span', { className: 'text-xs text-wt-muted font-medium' }, 'ℹ︎ 总览'));
+  }
+  return React.createElement('div', {
+    onClick: onToggle,
+    className: 'fixed top-16 left-6 z-10 max-w-lg px-4 py-3 bg-wt-surface/80 backdrop-blur border border-wt-border rounded-lg shadow-lg cursor-pointer transition-all duration-300',
+  },
+    React.createElement('p', { className: 'text-sm text-wt-muted leading-relaxed' }, SUMMARY),
+    React.createElement('p', { className: 'text-[0.65rem] text-wt-muted/50 mt-1.5' }, '点击收起')
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DetailPanel
+// ---------------------------------------------------------------------------
+function DetailPanel({ nodeId, node, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  const codeHtml = HIGHLIGHTED[nodeId];
+  return React.createElement('div', {
+    className: 'fixed top-4 right-4 bottom-4 w-[560px] max-w-[calc(100vw-2rem)] z-30 bg-wt-surface border border-wt-border rounded-xl shadow-2xl flex flex-col overflow-hidden',
+  },
+    React.createElement('button', {
+      onClick: onClose,
+      className: 'absolute top-3 right-3 z-10 w-7 h-7 rounded-md border border-wt-border bg-wt-raised text-wt-muted flex items-center justify-center text-lg hover:bg-wt-red hover:border-wt-red hover:text-white transition-colors',
+    }, '×'),
+    React.createElement('div', { className: 'flex-1 overflow-y-auto p-5' },
+      React.createElement('h2', { className: 'text-lg font-bold text-wt-fg mb-3 pr-9' }, node.title),
+      React.createElement('div', { className: 'dt-body' }, React.createElement('p', null, node.description)),
+      node.code && React.createElement('div', { className: 'dt-body' },
+        codeHtml
+          ? React.createElement('div', { dangerouslySetInnerHTML: { __html: codeHtml } })
+          : React.createElement('pre', { className: 'code-fallback' }, React.createElement('code', null, node.code))
+      ),
+      node.files && node.files.length > 0 && React.createElement('div', { className: 'mt-4 pt-3 border-t border-wt-border' },
+        React.createElement('div', { className: 'text-[0.7rem] uppercase tracking-wider text-wt-muted font-semibold mb-1.5' }, 'Files'),
+        React.createElement('code', { className: 'text-sm text-wt-file font-mono leading-relaxed' },
+          node.files.map((f, i) => React.createElement('span', { key: i }, f, React.createElement('br')))
+        )
+      )
+    )
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ZoomControls
+// ---------------------------------------------------------------------------
+function ZoomControls({ zoomDisplayRef, onZoomIn, onZoomOut, onFit }) {
+  const btn = 'w-8 h-8 rounded-md border border-wt-border bg-wt-surface text-wt-fg flex items-center justify-center hover:bg-wt-raised transition-colors text-base leading-none';
+  return React.createElement('div', {
+    className: 'fixed bottom-5 left-5 z-20 flex items-center gap-2 px-2 py-1.5 bg-wt-surface/80 backdrop-blur border border-wt-border rounded-lg shadow-xl',
+  },
+    React.createElement('button', { className: btn, onClick: onZoomOut, title: 'Zoom out' }, '−'),
+    React.createElement('span', { ref: zoomDisplayRef, className: 'text-xs text-wt-muted w-12 text-center tabular-nums' }, '100%'),
+    React.createElement('button', { className: btn, onClick: onZoomIn, title: 'Zoom in' }, '+'),
+    React.createElement('button', { className: btn + ' ml-1 text-[0.7rem]', onClick: onFit, title: 'Fit to screen' }, 'Fit')
+  );
+}
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+function App() {
+  const [activeId, _setActiveId] = useState(null);
+  const [summaryCollapsed, setSummaryCollapsed] = useState(true);
+  const pz = usePanZoom();
+
+  const setActiveNode = useCallback((nodeId) => {
+    _setActiveId(nodeId);
+    document.querySelectorAll('.mermaid-wrap .node').forEach(n => { n.style.opacity = nodeId ? '0.4' : '1'; });
+    if (nodeId) {
+      const el = document.querySelector(`.mermaid-wrap .node[id*="${nodeId}"]`);
+      if (el) el.style.opacity = '1';
+    }
+  }, []);
+
+  const closeDetail = useCallback(() => {
+    _setActiveId(null);
+    document.querySelectorAll('.mermaid-wrap .node').forEach(n => { n.style.opacity = '1'; });
+  }, []);
+
+  useEffect(() => { setTimeout(pz.fitToScreen, 600); }, [pz.fitToScreen]);
+
+  return React.createElement(React.Fragment, null,
+    React.createElement('header', {
+      className: 'fixed top-0 inset-x-0 z-10 px-6 py-3.5 bg-gradient-to-b from-wt-bg to-transparent pointer-events-none',
+    },
+      React.createElement('h1', { className: 'text-base font-semibold text-wt-fg' }, 'Codex：模型 JSON 之后发生了什么'),
+      React.createElement('p', { className: 'text-sm text-wt-muted mt-0.5' }, '客户端 × 模型端视角——一次模型往返的完整解剖')
+    ),
+    React.createElement(Summary, { collapsed: summaryCollapsed, onToggle: () => setSummaryCollapsed(c => !c) }),
+    React.createElement('div', { ref: pz.viewportRef, className: 'w-full h-screen overflow-hidden cursor-grab active:cursor-grabbing' },
+      React.createElement('div', { ref: pz.canvasRef, className: 'origin-top-left will-change-transform inline-block p-[80px_60px_60px]' },
+        React.createElement(MermaidDiagram, { onNodeClick: setActiveNode })
+      )
+    ),
+    React.createElement(ZoomControls, {
+      zoomDisplayRef: pz.zoomDisplayRef, onZoomIn: pz.zoomIn, onZoomOut: pz.zoomOut, onFit: pz.fitToScreen,
+    }),
+    React.createElement('div', {
+      className: 'fixed bottom-5 left-1/2 -translate-x-1/2 z-20 flex gap-4 px-4 py-2 bg-wt-surface border border-wt-border rounded-lg shadow-xl',
+    }, LEGEND.map(l => React.createElement('span', { key: l.label, className: 'flex items-center gap-1.5 text-xs text-wt-muted' },
+      React.createElement('span', { className: `w-2 h-2 rounded-full ${l.color}` }), l.label
+    ))),
+    activeId && NODES[activeId] && React.createElement(DetailPanel, { nodeId: activeId, node: NODES[activeId], onClose: closeDetail }),
+    React.createElement('div', { className: 'fixed bottom-5 right-5 z-20 text-xs text-wt-muted opacity-50' },
+      React.createElement('kbd', null, '滚轮'), ' 缩放 · ',
+      React.createElement('kbd', null, '拖拽'), ' 平移 · ',
+      '点击节点看详情'
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>
