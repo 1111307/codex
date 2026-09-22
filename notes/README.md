@@ -11,7 +11,7 @@
 | [multi-agent.md](multi-agent.md) | 多智能体：goroutine 拓扑、spawn 全流程、三道路径、两道限流闸、Go 视角的坑 |
 | [skills-vs-tools.md](skills-vs-tools.md) | Skill 与 Tool 的本质区别：渐进披露、两条注入路径、三种 role、目录预算 |
 | [fault-tolerance.md](fault-tolerance.md) | 容错：退避与抖动、传输降级、错误分类、panic 传播链、上下文压缩 |
-| [turn-loop.md](turn-loop.md) | 两层循环与审批挂起：外层插话入口、内层 ReAct、oneshot 协作式挂起、Go 翻译 |
+| [turn-loop.md](turn-loop.md) | 两层循环与审批挂起：外层插话入口、内层 ReAct、oneshot 协作式挂起、五张 waiter 表的退场路径、Go 翻译 |
 | [session-registry.md](session-registry.md) | 会话注册表：map 何时写、resume 三路径（SQLite 只是索引）、启动零加载、三层存储 |
 | [compaction.md](compaction.md) | 上下文压缩全解：触发地图、三路分发、90%/95% 双阈值、AI 摘要算法、模板全文 |
 | [interview-qa.md](interview-qa.md) | Agent 开发面试题对照本项目源码作答（含来源与可信度说明） |
