@@ -8,13 +8,14 @@
 
 | 文件 | 内容 |
 |---|---|
-| [multi-agent.md](multi-agent.md) | 多智能体：goroutine 拓扑、spawn 全流程、三道路径、两道限流闸、Go 视角的坑 |
+| [loops-agents-sandbox-go.md](loops-agents-sandbox-go.md) | 三条链串起来：收件循环/双层回合、spawn 子会话、exec 时启动工具沙箱，Go 结构示意 |
+| [multi-agent.md](multi-agent.md) | 多智能体：Session/task 拓扑、spawn/配置继承、V1/V2 终态通知、两道限流闸、Go 视角的坑 |
 | [skills-vs-tools.md](skills-vs-tools.md) | Skill 与 Tool 的本质区别：渐进披露、两条注入路径、三种 role、目录预算 |
 | [fault-tolerance.md](fault-tolerance.md) | 容错：退避与抖动、传输降级、错误分类、panic 传播链、上下文压缩 |
 | [turn-loop.md](turn-loop.md) | 两层循环与审批挂起：外层插话入口、内层 ReAct、oneshot 协作式挂起、五张 waiter 表的退场路径、Go 翻译 |
 | [session-registry.md](session-registry.md) | 会话注册表：map 何时写、resume 三路径（SQLite 只是索引）、启动零加载、三层存储 |
 | [mcp-architecture.md](mcp-architecture.md) | MCP 拓扑：rmcp 钉版 3.2.0、Legacy/V20260728 双模式、仅 Stdio+StreamableHttp、TUI 反向 server（127.0.0.1:0 + AUTHORIZATION） |
-| [sandbox-permissions.md](sandbox-permissions.md) | 沙箱权限：进程裸奔跑、子进程坐牢、所有模式全盘可读、三层默认值推导、Windows ReadOnly 降级 |
+| [sandbox-permissions.md](sandbox-permissions.md) | 沙箱权限：legacy 预设与命名 profile 的区别、读权限例外、工具子进程的沙箱选择、Windows ReadOnly 降级 |
 | [compaction.md](compaction.md) | 上下文压缩全解：触发地图、三路分发、90%/95% 双阈值、AI 摘要算法、模板全文 |
 | [interview-qa.md](interview-qa.md) | Agent 开发面试题对照本项目源码作答（含来源与可信度说明） |
 

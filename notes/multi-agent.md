@@ -1,23 +1,22 @@
 # 多智能体架构
 
-一句话：**不是「多线程」，是「多 goroutine + 消息传递」，每个 agent 就是一个完整的独立 session。** 父和子没有本质区别，只是 `AgentPath` 和 `depth` 不同。
+一句话：**不是为每个 agent 启动独立 OS 进程，而是在同一进程内为每个 agent 建立独立 Session/异步任务**（Go 心智模型：goroutine + 消息传递）。父和子共用 AgentControl，但会话、回合、历史和信箱各自独立。贯通双层 loop 与沙箱的时序见 [loops-agents-sandbox-go.md](loops-agents-sandbox-go.md)。
 
 ## 0. Rust/Tokio → Go 对照表
 
 | Codex (Rust/Tokio) | Go 里的对应物 | 差异要点 |
 |---|---|---|
-| `tokio::spawn(fut)` | `go f()` | 基本等价 |
-| `async_channel::bounded(n)` | `make(chan T, n)` | 一样，有背压 |
-| `Arc<Session>` | `*Session` | Go 有 GC，不用手动 Arc |
-| `Mutex<HashMap>` | `sync.Mutex` + `map` | 一样 |
-| `AtomicUsize` + `compare_exchange_weak` | `atomic.Int64.CompareAndSwap` | 一样 |
+| `tokio::spawn(fut)` | `go f()` | 都是调度并发任务，但 panic、取消和 Join 语义不同 |
+| `async_channel::bounded(n)` | `make(chan T, n)` | 都有背压 |
+| `async_channel::unbounded()` | 无标准库直接对应 | `chan` 总是无缓冲或固定容量，须自行设计背压/队列 |
+| `Arc<Session>` | `*Session` | Go 有 GC，不用手动 Arc；共享可变状态仍要同步 |
+| `Mutex<HashMap>` | `sync.Mutex` + `map` | 读写都要保护 |
+| `AtomicUsize` + `compare_exchange_weak` | `atomic.Int64.CompareAndSwap` | 配额计数可用 CAS |
 | `watch::Receiver<T>` | **没有直接对应** | 要自己封「最新值 + 广播」 |
-| `CancellationToken` | `context.Context` | 都是协作式取消 |
-| `Drop` / `AbortOnDropHandle` | `defer` | Go 的 defer **不能**中止 goroutine |
-| `Weak<ThreadManagerState>` | **没有直接对应** | Go GC 能处理环，弱引用要 `SetFinalizer` |
-| `JoinHandle` | **没有** | goroutine 退出收不到通知 |
-
-最后三行 Go 缺的东西，恰好是这套架构依赖最深的机制。见第 7 节。
+| `CancellationToken` | `context.Context` | 两者都须在任务中协作检查 |
+| `Drop` / `AbortOnDropHandle` | `defer` + 显式 cancel | `defer` 本身不会中止 goroutine |
+| `Weak<ThreadManagerState>` | **没有可靠的标准库等价物** | 设计所有权/主动解除引用；`runtime.SetFinalizer` 不是弱引用 |
+| `JoinHandle` | 显式 done channel / `sync.WaitGroup` | goroutine 不自带可等待句柄 |
 
 ## 1. 三层结构
 
@@ -28,7 +27,7 @@ ThreadManagerState        全局注册表，一进程一份
 AgentControl              一棵 agent 树共享一份
   registry: map[path]*AgentMeta, totalCount, limiter
         ↑ Clone 给每个 agent
-Agent (goroutine)  ×N     每个 = 独立 Session + 独立 rollout + 独立信箱
+Agent (Session/task) ×N  每个 = 独立 Session + 独立 rollout + 独立信箱
 ```
 
 `codex-rs/core/src/agent/control.rs:117-140`：
@@ -42,16 +41,16 @@ Agent (goroutine)  ×N     每个 = 独立 Session + 独立 rollout + 独立信�
 /// which keeps the registry scoped to that root thread rather than the entire `ThreadManager`.
 ```
 
-**一个 root session 一个 AgentControl** —— 配额是「每个用户会话」的，不是全局的。开两个 Codex 窗口，各自独立计数。
+**每棵 root session 树共用一份 AgentControl**，spawn 配额按这棵树计算，不是 ThreadManager 的全局计数；不能简单用 UI 窗口数量推断 root 树数量。
 
-`manager: Weak<ThreadManagerState>` 是弱引用，注释里写明原因：
+`manager: Weak<ThreadManagerState>` 是弱引用，注释原文（`control.rs:127-130`）说明要避免引用环：
 
 ```rust
 /// This is `Weak` to avoid reference cycles and shadow persistence of the form
 /// `ThreadManagerState -> CodexThread -> Session -> SessionServices -> ThreadManagerState`.
 ```
 
-## 2. 一个 agent = 一个 goroutine + 两个 channel
+## 2. 一个 agent = 一个 Session + 收件 task + 回合 task
 
 SQ/EQ 协议（Submission Queue / Event Queue）的物理实现，`codex-rs/core/src/session/mod.rs:574-575`：
 
@@ -60,19 +59,19 @@ let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
 let (tx_event, rx_event) = async_channel::unbounded();
 ```
 
-**一有一无是刻意的**：入站有界，防止调用方灌爆；出站无界，防止 agent 卡在发事件上。
+**一有一无是刻意的**：入站有界，防止调用方灌爆；出站无界，使事件发送不因接收端慢而受固定容量限制，但也意味着内存不能靠 channel 容量封顶。
 
-Go 版：
+Go 版必须为事件出口另定队列与背压策略；标准 `chan Event` 不是无界通道：
 
 ```go
 type SessionIO struct {
-    sub    chan Op       // 入口：外面往里投指令  (bounded, 有背压)
-    events chan Event    // 出口：agent 往外吐事件  (unbounded, 不阻塞)
-    done   chan struct{} // agent 退出时 close —— 补 Go 缺失的 JoinHandle
+    sub  chan Op       // 入口：make(chan Op, n)，固定容量
+    done chan struct{} // Session 收件循环退出时显式 close
+    // 事件出口需自行选择队列/背压策略，不能把 chan Event 当成 unbounded。
 }
 ```
 
-主循环，对应 `codex-rs/core/src/session/mod.rs:877-890` 的 `tokio::spawn(submission_loop(...))`：
+收件循环，对应 `codex-rs/core/src/session/mod.rs:877-890` 的 `tokio::spawn(submission_loop(...))`：
 
 ```rust
 // This task will run until Op::Shutdown is received.
@@ -84,46 +83,33 @@ let session_loop_handle = tokio::spawn(async move {
 });
 ```
 
-Go 版：
+Go 结构示意（只表现收件与回合分离；单活跃 turn 的同步仍需实现）：
 
 ```go
-func (a *Agent) Run() {
+func (a *Agent) submissionLoop() {
     defer close(a.IO.done)
-    defer a.status.Set(AgentShutdown)
-
-    // 把 panic 关在当前 agent 里 —— Go 里这行是必须的！
-    defer func() {
-        if r := recover(); r != nil {
-            a.status.Set(AgentErrored(fmt.Sprint(r)))
-        }
-    }()
-
-    for {
-        select {
-        case op, ok := <-a.IO.sub:
-            if !ok {
-                return
-            }
-            switch op.Kind {
-            case OpUserInput:
-                a.RunTurn(op)               // 模型请求 → 工具 → 再请求的循环
-            case OpInterAgentCommunication:
-                a.HandlePeerMessage(op)
-            case OpInterrupt:
-                a.CancelTurn()              // 等价于 cancel ctx
-            case OpShutdown:
-                return                      // ← 循环唯一的正常出口
-            }
+    for op := range a.IO.sub {
+        switch op.Kind {
+        case OpUserInput:
+            a.startOrSteerTurn(op) // 无活跃回合时另起 goroutine；有则入 pending 队列
+        case OpInterAgentCommunication:
+            a.HandlePeerMessage(op)
+        case OpExecApproval:
+            a.NotifyApproval(op)
+        case OpInterrupt:
+            a.CancelTurn()
+        case OpShutdown:
+            return
         }
     }
 }
 ```
 
-**父 agent 和子 agent 跑的是同一个函数。**
+**父子运行同一套 Session 回合机制**，但 submission_loop 不能同步调用 `runTurn`：否则等待模型或审批时就收不到审批答复和用户插话。原代码在 `session/turn_input.rs:269-329` 尝试 steer 或 `spawn_task(RegularTask::new())`，后者由 `tasks/mod.rs:360-409` 起单独任务。Go 版收件循环退出时还须取消并等待活跃回合任务；上面仅展示消息分派。
 
 ## 3. spawn_agent 全流程
 
-模型调 `spawn_agent` 时，它就是个普通 tool handler：`codex-rs/core/src/tools/handlers/multi_agents/spawn.rs:47` 的 `handle_spawn_agent`，背后调 `AgentControl::spawn_agent_internal`（`codex-rs/core/src/agent/control/spawn.rs:614`）。
+模型调 `spawn_agent` 时，它就是个普通 tool handler：`codex-rs/core/src/tools/handlers/multi_agents/spawn.rs:47-134` 的 `handle_spawn_agent` 构造子 agent 配置，调用 `AgentControl::spawn_agent_with_metadata`；内部进入 `agent/control/spawn.rs:614-819` 的 `spawn_agent_internal`。配置从当前 turn 刷新模型、审批、cwd 和 permission profile（`tools/handlers/multi_agents_common.rs:170-264`），role 在此基础上覆盖允许的字段；`fork_context=true` 才会选择完整父历史 fork（`spawn.rs:94-109, 121-124`）。**这里只建会话和提交输入，尚未启动 OS 命令进程或沙箱。**
 
 深度检查在 handler 里，`multi_agents/spawn.rs:68-74`：
 
@@ -147,10 +133,11 @@ pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bo
 }
 ```
 
-Go 版全流程：
+Go 版全流程（省略 V2 residency slot 与 execution limiter，不能直接运行）：
 
 ```go
 func (c *AgentControl) SpawnAgent(cfg Config, input []UserInput, src SessionSource) (*LiveAgent, error) {
+    // cfg 假设已从父 turn 的生效快照生成；fork_context 分支省略。
     // ① 深度闸门 —— multi_agents/spawn.rs:68-74
     childDepth := src.Depth + 1
     if childDepth > cfg.AgentMaxDepth {
@@ -169,23 +156,26 @@ func (c *AgentControl) SpawnAgent(cfg Config, input []UserInput, src SessionSour
         }
     }()
 
-    // ③ 起一个新的 agent goroutine —— spawn.rs:709
-    agent := c.manager.NewThread(cfg, c, src)
-    go agent.Run()           // ← 就是那个 tokio::spawn(submission_loop(...))
+    // ③ 建会话并启动收件循环；等到 SessionConfigured 后登记 ThreadManager
+    agent, err := c.manager.NewThread(cfg, c, src) // 内部启动并等到 SessionConfigured
+    if err != nil { return nil, err }
 
-    // ④ 登记进 registry
+    // ④ 登记进 registry；commit 后失败必须显式 shutdown/release
     meta := AgentMeta{ID: agent.ID, Path: agent.Path}
     slot.Commit(meta)
     committed = true
 
-    // ⑤ 投第一句话，agent 开始动 —— spawn.rs:784-788
-    agent.IO.sub <- Op{Kind: OpUserInput, Items: input}
+    // ⑤ 派首条输入，启动/steer 子 agent 的回合 —— spawn.rs:784-788
+    if err := agent.StartOrSteer(input); err != nil {
+        agent.ShutdownAndRelease() // Go 设计：commit 后失败显式回收
+        return nil, err
+    }
 
     return &LiveAgent{ThreadID: agent.ID, Status: agent.Status()}, nil
 }
 ```
 
-**`slot + committed` 这个模式是 Go 里必须显式写的**。Rust 的 `SpawnReservation` 在 `Drop` 里检查 `self.active`（`registry.rs:393-402`）：
+**`slot + committed` 这个模式是 Go 里必须显式写的**。Rust 的 `SpawnReservation` 在 `Drop` 里检查 `self.active`（`agent/registry.rs:393-401`）：
 
 ```rust
 impl Drop for SpawnReservation {
@@ -200,7 +190,7 @@ impl Drop for SpawnReservation {
 }
 ```
 
-意义是**异常安全的名字占用**：抢到名额 → 中途任何一步失败 → 名额自动归还。Go 里忘写那个 `defer`，一次 spawn 失败会永久漏掉一个名额，跑到 `max_threads` 之后整个会话再也开不出 agent，而且没有任何报错。
+意义是**异常安全的名额与路径占用**：预留 → commit 之前失败 → Drop 自动归还。源码在 commit 后派首条输入（`agent/control/spawn.rs:726-799`）；若此时派发失败，**不能归功于 reservation 的 Drop**，相关生命周期回收须另核对。上面 Go 版的 `ShutdownAndRelease()` 是建议的显式失败清理，不宣称逐行等价于当前 Rust 实现。
 
 ## 4. 两道限流闸
 
@@ -233,7 +223,10 @@ fn try_increment_spawned(&self, max_threads: usize) -> bool {
             return false;
         }
         match self.total_count.compare_exchange_weak(
-            current, current + 1, Ordering::AcqRel, Ordering::Acquire,
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
         ) {
             Ok(_) => return true,
             Err(updated) => current = updated,
@@ -260,16 +253,25 @@ func (r *AgentRegistry) tryIncrement(max int64) bool {
 
 ## 5. 通信：三道路径
 
-Go 的哲学 *"Do not communicate by sharing memory; share memory by communicating."* —— Codex 完全就是这个路子。**agent 之间没有共享可变状态，全靠往对方信箱投消息。**
+父子 agent 的任务与结果通过控制面寻址和消息发送；但它们还共享 AgentControl、registry、限额器等并发状态（`agent/control.rs:117-139`），**不能说「没有共享可变状态」**。Go 类比也要给这些共享 map/状态加锁或使用原子变量。
 
 ### ① 父 → 子：派活
 
 `codex-rs/core/src/agent/control.rs:194` 的 `send_input` → `thread.start_or_steer_turn(...)`。有两个结果分支（`control.rs:206-216`）：
 
 ```rust
-match thread.start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options)).await {
+match thread
+    .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
+    .await
+{
     Ok(TurnInputSubmission::Started { turn_id }) => Ok(turn_id),
-    Ok(TurnInputSubmission::Steered { .. }) => Ok(Uuid::now_v7().to_string()),
+    Ok(TurnInputSubmission::Steered { .. }) => {
+        // MAv1 exposes an opaque `submission_id` to the model. The legacy
+        // `Op::UserInput` path returned a fresh ID for every steer, while the
+        // turn-input API returns the active turn ID. Keep the tool-visible ID
+        // unique without adding a submission receipt back to Core.
+        Ok(Uuid::now_v7().to_string())
+    }
     Ok(TurnInputSubmission::NotSubmitted { reason }) => Err(CodexErr::InvalidRequest(
         format!("turn input was not submitted: {reason:?}"),
     )),
@@ -277,59 +279,34 @@ match thread.start_or_steer_turn(TurnInputRequest::user_input(input).on_start(st
 }
 ```
 
-**同一个入口既是「派新任务」也是「追加指令」**——取决于子 agent 当前 busy 不 busy。
+**同一个入口既是「派新任务」也是「追加指令」**——取决于子 agent 当前是否有活跃 turn。
 
-### ② 子 → 父：干完了主动汇报
+### ② 子 → 父：终态通知，V1/V2 两条路径
 
-独立的 watcher goroutine，`codex-rs/core/src/agent/control.rs:626-716`：
+**spawn 后只在非 V2 启动 watcher**（`codex-rs/core/src/agent/control/spawn.rs:800-812`）；它在 `control.rs:626-715` 订阅子状态、等待终态。逐字片段（`:641-656`）：
 
 ```rust
-fn maybe_start_completion_watcher(
-    &self,
-    child_thread_id: ThreadId,
-    session_source: Option<SessionSource>,
-    child_reference: String,
-    child_agent_path: Option<AgentPath>,
-) {
-    // ...
-    let control = self.clone();
-    tokio::spawn(async move {
-        let status = match control.subscribe_status(child_thread_id).await {
-            Ok(mut status_rx) => {
-                let mut status = status_rx.borrow().clone();
-                while !is_final(&status) {
-                    if status_rx.changed().await.is_err() {
-                        status = control.get_status(child_thread_id).await;
-                        break;
+            let status = match control.subscribe_status(child_thread_id).await {
+                Ok(mut status_rx) => {
+                    let mut status = status_rx.borrow().clone();
+                    while !is_final(&status) {
+                        if status_rx.changed().await.is_err() {
+                            status = control.get_status(child_thread_id).await;
+                            break;
+                        }
+                        status = status_rx.borrow().clone();
                     }
-                    status = status_rx.borrow().clone();
+                    status
                 }
-                status
+                Err(_) => control.get_status(child_thread_id).await,
+            };
+            if !is_final(&status) {
+                return;
             }
-            Err(_) => control.get_status(child_thread_id).await,
-        };
-        // ...
-    });
-}
+```
 ```
 
-V2 路径（`control.rs:687-703`）：
-
-```rust
-let communication = InterAgentCommunication::new(
-    child_agent_path,
-    parent_agent_path,
-    Vec::new(),
-    message,
-    /*trigger_turn*/ false,
-);
-let context = AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
-let _ = control
-    .send_inter_agent_communication(parent_thread_id, communication, context, TurnStartOptions::default())
-    .await;
-```
-
-V1 路径（`control.rs:709-714`）：
+非 V2 正常路径在 `control.rs:706-714` 向父会话注入 `SubagentNotification`：
 
 ```rust
 parent_thread
@@ -340,26 +317,38 @@ parent_thread
     .await;
 ```
 
-**V1/V2 的区别**：V1 是「往父的上下文插一段通知」（单向、上下文污染），V2 是「给父发一条正经的 agent 间消息」（有 from/to、有 `trigger_turn` 语义）。这是个明显的架构演进。
+**正常 V2 路径不是 watcher！** 子 session 发终态回合事件后（`session/mod.rs:2271-2273`），由 `:2292-2338` 检查 `is_final`，在 :2403-2435 直接将 `InterAgentCommunication` 送到父方：
 
-`trigger_turn: false` 很重要——**只注入上下文，不唤醒父 agent 开新 turn**。
+```rust
+let communication = InterAgentCommunication::new(
+    child_agent_path.clone(),
+    parent_agent_path,
+    Vec::new(),
+    message,
+    /*trigger_turn*/ false,
+);
+```
 
-Go 版：
+这里的 `trigger_turn: false` 是「送消息但不要求唤醒空闲父 agent 开新 turn」。`agent/status.rs:26-30` 的 `Interrupted` 不是 final；完成通知不是「所有 turn 退出都发」。`control.rs:663-705` 仍留有 watcher 内部的 V2 防御分支，但不能把它描述成正常 V2 spawn 路径。
+
+Go 示意要分开：
 
 ```go
-func (c *AgentControl) startCompletionWatcher(child *Agent, parentID ThreadID) {
-    go func() {   // ← 独立 goroutine，不是父 agent 轮询
-        final := child.status.WaitFinal(context.Background())
-        if !final.IsFinal() {
-            return
-        }
-        c.SendInterAgentCommunication(parentID, InterAgentCommunication{
-            From:        child.Path,
-            To:          parentPath,
-            Message:     formatCompletionMessage(child.Path, parentPath, final),
-            TriggerTurn: false,
-        })
+// 非 V2：spawn 后起 watcher，等终态再注入父方上下文。
+func watchLegacyCompletion(child *Agent, parent *Agent) {
+    go func() {
+        final := child.Status.WaitFinal()
+        if final.IsFinal() { parent.InjectSubagentNotification(child.ID, final) }
     }()
+}
+
+// V2：在子 session 发最终 TurnComplete/TurnAborted 事件的路径中直接转发。
+func notifyParentOnTerminalTurn(child *Agent, parent *Agent, event TurnEvent) {
+    status := statusFromEvent(event)
+    if !status.IsFinal() { return }
+    parent.SendAgentMessage(CompletionMessage{
+        From: child.Path, To: parent.Path, Status: status, TriggerTurn: false,
+    })
 }
 ```
 
@@ -390,7 +379,7 @@ async fn wait_for_final_status(
 }
 ```
 
-超时默认 30 秒，被 clamp（`wait.rs:92-100`）：
+默认 30 秒（`tools/handlers/multi_agents_common.rs:31` 的 `DEFAULT_WAIT_TIMEOUT_MS = 30_000`），参数须大于零且被 clamp 到允许范围（`wait.rs:92-100`）：
 
 ```rust
 let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
@@ -404,7 +393,7 @@ let timeout_ms = match timeout_ms {
 };
 ```
 
-Go 版（标准并发模式）：
+Go 版（示意：`WaitFinal` 要正确实现订阅、取消和终态判断；实际 Rust 还会收割同时就绪的其他结果，见 `wait.rs:159-189`）：
 
 ```go
 func (c *AgentControl) WaitAgent(targets []ThreadID, timeoutMs int) WaitResult {
@@ -417,8 +406,8 @@ func (c *AgentControl) WaitAgent(targets []ThreadID, timeoutMs int) WaitResult {
             done = append(done, Result{id, AgentNotFound})  // NotFound 也算终态
             continue
         }
-        if w.Value().IsFinal() {
-            done = append(done, Result{id, w.Value()})
+        if status := w.Value(); status.IsFinal() {
+            done = append(done, Result{id, status})
         } else {
             watches = append(watches, w)
         }
@@ -428,17 +417,17 @@ func (c *AgentControl) WaitAgent(targets []ThreadID, timeoutMs int) WaitResult {
     }
 
     // ② 并发等所有 watch
-    ctx, cancel := context.WithTimeout(context.Background(), timeout)
+    ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
     defer cancel()
 
     ch := make(chan Result, len(watches))
     for _, w := range watches {
         go func(w *StatusWatch) {
-            ch <- w.WaitFinal(ctx)
+            if r, ok := w.WaitFinal(ctx); ok { ch <- r }
         }(w)
     }
 
-    // ③ 拿到第一个就返回，不是等所有
+    // ③ 至少等一个终态；实际 Rust 还会收割此刻已就绪的其他终态。
     select {
     case r := <-ch:
         return WaitResult{Status: []Result{r}, TimedOut: false}
@@ -462,16 +451,11 @@ func (c *AgentControl) WaitAgent(targets []ThreadID, timeoutMs int) WaitResult {
 
 ## 7. Go 视角下的五个坑
 
-**① panic 行为完全相反**
+**① panic 行为不同**
 
-```rust
-// Rust: task panic → 该 task 死，进程活  → 靠 JoinError 感知
-// Go:   goroutine panic → 整个进程死      → 必须 recover
-```
+Rust/Tokio 的异步 task 在 `panic=unwind` 下可通过 `JoinHandle` 获得 `JoinError`；Go 某个 goroutine 的未恢复 panic 会让**整个进程退出**。如果要做 Go 子任务的 panic 边界，应在启动该 goroutine 的函数中 `defer recover()`，将 panic 转成错误/终态并关闭 done channel；只在另一个 goroutine 的收件循环里 recover **保护不到**独立的回合 goroutine。Rust 若以 `panic=abort` 构建则不能套用 unwind 的结论。
 
-Rust 里 `tokio::spawn` 的 task panic 被 catch 在 task 边界内（默认 `panic=unwind`，Codex 也没开 `panic="abort"`）。**Go 里不 recover 就是全进程崩。** 所以 Go 版必须在 `Run()` 里加 `defer recover()`，否则一个子 agent 出 bug 会拖垮所有 agent——而这个隔离性正是多 agent 架构最重要的性质之一。
-
-**② 没有 JoinHandle，退出不可见**
+**② 没有 JoinHandle，退出需自己通知**
 
 `codex-rs/core/src/codex_thread.rs:689`：
 
@@ -481,7 +465,7 @@ pub(crate) fn is_running(&self) -> bool {
 }
 ```
 
-**这是被逼出来的设计**——因为 `codex-rs/core/src/session/mod.rs:1060` 那里，JoinHandle 的返回值直接被扔了：
+**源码事实：**`codex-rs/core/src/session/mod.rs:1060` 附近把会话循环的 JoinHandle 转为可共享的退出 future：
 
 ```rust
 pub(crate) fn session_loop_termination_from_handle(
@@ -495,9 +479,9 @@ pub(crate) fn session_loop_termination_from_handle(
 }
 ```
 
-`let _ = handle.await;` 意味着 **panic 和正常退出无法区分**。
+此处只把 handle 完成转换为「已终止」信号，**丢弃了 JoinError 与正常退出的区别**；不要推断进程其他地方都完全无法检测错误。
 
-Go 里更彻底——goroutine 退出了你完全不知道。所以必须在 `SessionIO` 里自己维护 `done chan struct{}` 并 `defer close(done)`。
+Go goroutine 没有内建的 JoinHandle；若需要等待退出，就在 `SessionIO` 里维护 `done chan struct{}` 并在该 goroutine 退出时 `defer close(done)`（若还需区分错误，再传递退出结果）。
 
 **③ 没有 watch，「最新值 + 广播」要自己封**
 
@@ -507,7 +491,7 @@ tokio 的 `watch` 语义是：只保留最新值，所有订阅者收到变更�
 type StatusWatch struct {
     mu  sync.RWMutex
     val AgentStatus
-    ch  chan struct{}   // 变更时 close 旧的，新建一个 —— close 是广播
+    ch  chan struct{}   // 构造时初始化；变更时 close 旧的，新建一个
 }
 
 func (w *StatusWatch) Set(v AgentStatus) {
@@ -525,20 +509,18 @@ func (w *StatusWatch) Value() AgentStatus {
 }
 ```
 
-`close(chan)` 当广播用，是 Go 里非常经典的技巧。
+`close(chan)` 当广播用，是 Go 里常见的技巧。构造时要先初始化 `ch`，等待方必须在同一把锁下同时读取 `val` 与当前 `ch`，否则「读了旧状态再订阅新 channel」会错过终态变更；上面只是状态更新半边。
 
 **④ 没有 Drop，名额回收全靠人记**
 
 Rust 的 `SpawnReservation` 靠 `Drop` 自动还名额。Go 里同样的事必须显式 `defer`，且要注意 `Commit` 之后不能再回滚。忘写的后果是**永久性泄漏**（见第 3 节）。
 
-**⑤ 取消是协作式的**
+**⑤ 取消边界不同**
 
-Rust 的 `AbortOnDropHandle`（`codex-rs/core/src/tools/parallel.rs:150`）是 drop 即取消，你不可能忘。Go 的 `context.Context` 是协作式的——goroutine 不检查 `ctx.Done()` 就永远不退出。
-
-两者其实都在 await 点生效，但差别在**「能不能忘」**：Rust 里是类型系统保证的，Go 里是纪律保证的。
+Rust 的 `AbortOnDropHandle` 在 handle drop 时可调用 Tokio 的 task abort；Codex 还使用 `CancellationToken` 做协作式退出（见 `tasks/mod.rs:360-409`）。Go 的 `context.Context` 本身不会强制杀 goroutine；goroutine 不检查 `ctx.Done()` 或没有可取消的阻塞点就不会退出。实现时须明确取消传播、等待与清理顺序。
 
 ## 8. 一句话总结
 
-> **Codex 的多 agent = 每个 agent 一个 goroutine + 两个 channel，用消息传递代替共享内存，用一个共享的 AgentControl 做配额和寻址，用独立的 watcher goroutine 做完成通知。**
+> **Codex 的多 agent = 每个 agent 一个独立 Session/回合任务，父子共用 AgentControl 做配额、寻址与通信；非 V2 watcher 等终态，V2 从子回合终态事件直接通知父。**
 
-而且这个架构有个很关键的性质——**加一层 agent 不需要改主循环**。父 agent 调 `spawn_agent` 和调 `read_file` 走的是同一条路：`build_tool_call` → tool handler → 返回结果。多 agent 没有任何特殊路径。
+而且这个架构有个关键性质——**加一层 agent 不需要改基础的回合采样循环**。模型调用 `spawn_agent` 与调用其他 function tool 都经工具分诊、handler；但 `spawn_agent` 的配置继承、注册、通信与执行容量有自己的专门路径。
