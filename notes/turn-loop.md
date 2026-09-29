@@ -41,13 +41,12 @@ loop {
 }
 ```
 
-外层退出信号只有两个：`terminal_error`（:89）或 `input_queue` 空（:92）。注意 :95 的 `next_input = Vec::new()`——传给下一轮 run_turn 的**不是数据，是开关**：内层看到 `input.is_empty()` 就自己去 input_queue 拉插话（`turn.rs:425-435` 的 `can_drain_pending_input` 门控）。
+`run_turn(...).await?` 若返回错误，外层会直接传播错误；成功返回后有两个提前结束条件：存在 `terminal_error`（:89-90）或 `input_queue` 没有 pending input（:92-93）。注意 :95 的 `next_input = Vec::new()`——传给下一轮 run_turn 的**不是数据，是开关**：内层看到 `input.is_empty()` 就自己去 input_queue 拉插话（`turn.rs:365, 427-435` 的 `can_drain_pending_input` 门控）。
 
-内层退出（`turn.rs:640-704`）：
+内层退出/续跑（`turn.rs:600-704`）：
 
-- `!needs_follow_up` → 跑 stop hooks → `break`（:702；stop hook 要求继续则 :690 的 `should_stop` 分支提前 break）
-- `needs_follow_up` → `continue`（:704）
-- 中途压缩成功 → `continue`（:639），压缩后接着跑
+- `needs_follow_up` 为真且压缩未接管时 → `continue`（:704）；中途压缩成功也会 `continue`（:639），并按 `model_needs_follow_up` 决定是否暂缓 drain 插话。
+- `!needs_follow_up` → 跑 stop hooks（:642-650）。若 hook 要求 block 且提供 continuation prompt，记录 prompt 后 `continue`（:661-678）；block 却没有 prompt 时只发 warning 并忽略 block（:679-687）。随后 `should_stop` 为真则 `break`（:689-690）；其余成功路径在 :702 `break`。
 
 `needs_follow_up = model_needs_follow_up || has_pending_input`（`turn.rs:565`）——模型还要继续（工具没跑完）**或**用户插了话，都算「需要下一轮」。这就是插话不打断模型的实现：插话只是让内层多转一圈。
 
@@ -75,7 +74,7 @@ let prev_entry = {
 };
 ```
 
-（:2808-2821）先把 sender 塞进 pending map，再给用户发审批事件（:2874），最后挂起等决议：
+（:2809-2820）先把 sender 塞进 pending map，再发审批事件（:2855-2874），最后挂起等决议：
 
 ```rust
 rx_approve.await.unwrap_or(ReviewDecision::Abort)
@@ -87,26 +86,26 @@ rx_approve.await.unwrap_or(ReviewDecision::Abort)
 
 1. **先注册再发送**（:2808 注释原话）。反过来写，用户的手速快过注册，响应就永远丢了。
 
-2. **`unwrap_or(Abort)`**：sender 被 drop 时 `await` 返回 `None`，视为 Abort。**没有超时机制——「表被清掉」就是超时机制。** sender 的死法有三条：
+2. **`unwrap_or(Abort)`**：这个 command-approval sender 被 drop 时，oneshot `await` 返回 `Err`，于是结果按 `ReviewDecision::Abort` 处理。这里没有审批超时；清理 waiter 表是 turn 退场清理，不是超时机制。对这条审批 waiter，sender 可能因以下原因被 drop：
 
    | 死法 | 位置 | 触发 |
    |---|---|---|
    | 被新 entry 覆盖 | `state/turn.rs:122-128` `insert_pending_approval` 把旧 sender 当返回值交出去，最后随 `prev_entry` 一起 drop | 同一个 `call_id` 二次请求审批 |
-   | 整张表被清 | `state/turn.rs:137-142` `clear_pending_waiters` 一次 `.clear()` 五张表 | turn abort / turn suspension |
-   | 表随 turn 一起 drop | `TurnState` 是 `ActiveTurn` 的字段（`state/turn.rs:34`） | 会话结束 |
+   | 整张表被清 | `state/turn.rs:137-143` `clear_pending_waiters` 清五张 waiter map | turn abort / turn suspension |
+   | `TurnState` 随 `ActiveTurn` drop | `state/turn.rs:31-35` | owning active-turn state 被销毁 |
 
    五张表在 `state/turn.rs:90-96`：`pending_approvals` / `pending_request_permissions` / `pending_user_input` / `pending_elicitations` / `pending_dynamic_tools`。
 
-3. **先 cancel 再清表**。`tasks/mod.rs:534-535` 注释原话：
+3. **取消/终止处理先于清表**。`tasks/mod.rs:534-535` 的原注释是：
 
    ```rust
    // Let interrupted tasks observe cancellation before dropping pending approvals, or an
    // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
    ```
 
-   即 `handle_task_abort`（`tasks/mod.rs:878-916`：cancel token → `select!` 等 `task.done` 或 `GRACEFULL_INTERRUPTION_TIMEOUT_MS = 100ms`（:69）→ `task.handle.abort()`）先跑完，`clear_pending` 才执行。两个调用点都在 `tasks/mod.rs`：`:536` 的 `abort_all_tasks`（:512）和 `:582` 的 `abort_turn_if_active`（:543）。顺序倒了，挂着的审批会先以「被拒绝」的错误回灌进对话历史，污染 `TurnAborted` 之前的事件序列。
+   两个 abort 调用点（`:512-541`、`:543-588`）先进入 `handle_task_abort`（`:878-920`）：取消 token，等待 `task.done` 或最多 `GRACEFULL_INTERRUPTION_TIMEOUT_MS = 100ms`（:69），然后 abort task handle 并调用 task 的 abort 清理。之后由 abort 流程发终态/生命周期事件，再在 `clear_pending`（`input_queue.rs:206-211`）清 waiter 与 pending input；清理具体发生在 `:536` / `:582`。因此不是「清表先于 TurnAborted」：源码注释说明的是先给协作式取消留窗口，避免审批等待被提前变成模型可见拒绝。若超时后硬 abort，审批 future 已被丢弃，清表不再唤醒它。
 
-唤醒走的是同一条 Op 提交通道。用户答复 → `Op::ExecApproval` → `codex-rs/core/src/session/handlers.rs:200` → `notify_approval`（`session/mod.rs:3364`）：
+唤醒走的是同一条 Op 提交通道。用户答复经 `Op::ExecApproval` 在 submission loop 分派（`session/handlers.rs:529-535`）；`exec_approval` 对非 `Abort` 决议在 `:196-200` 调 `notify_approval`，而 `Abort` 会走 `interrupt_task()`（:197-199）。`notify_approval` 位于 `session/mod.rs:3364-3383`：
 
 ```rust
 let entry = {
@@ -131,13 +130,13 @@ match entry {
 
 （:3365-3381）`remove_pending_approval` 拿走 sender 就地发送。它要求 `active_turn` 存在——turn 都没了自然无审批可唤醒，只剩一条 warn。
 
-注意 `tx_approve.send()` 是在**块作用域之外**执行的（`entry` 先把 sender 摘出来，两把锁都释放了才 send）。在 Rust 里这是好习惯（wake 不会同步跑接收方代码）；在 Go 里这是**硬约束**——持锁时做阻塞发送可能死锁。
+注意 `tx_approve.send()` 是在**块作用域之外**执行的（`entry` 先把 sender 摘出来，两把锁都释放了才 send）。在 Rust 里这样缩短锁作用域；在 Go 里则尤其重要——持锁时做可能阻塞的发送会造成死锁。
 
 前提是 `codex-rs/core/src/session/session.rs:50` 的文档保证：「A session has at most 1 running task at a time」——turn_state 里的 pending map 才不会跨 turn 串号。
 
 ## 3. 审批的三级优先级
 
-`codex-rs/core/src/tools/approvals.rs:487-489` 原话：
+`codex-rs/core/src/tools/approvals.rs:493-495` 原话：
 
 ```rust
 // Approval precedence is:
@@ -145,53 +144,69 @@ match entry {
 // 2. If StrictAutoReview || Guardian enabled, then Guardian. Else, user.
 ```
 
-Hooks（:490 的 `run_permission_request_hooks`）决了就不问人；没意见才落到 :512 的 `request_reviewer_approval`——Guardian（自动审查）开着问 Guardian，否则问用户。用户看到的审批框，其实是这条链的最后一环。
+Hooks（:496-512 的 `run_permission_request_hooks`）决了就不问 reviewer；没意见才落到 `request_reviewer_approval`（:542-557）——先尝试 Guardian，若无 Guardian 决议则问用户。用户看到的审批框是这条链的最后一环。
 
 ## 4. Go 翻译
 
 | Rust | Go | 注意 |
 |---|---|---|
-| `oneshot::channel()` | `ch := make(chan T, 1)` | 缓冲 1 是关键：发送方永不因接收方先走而卡死 |
-| `rx.await.unwrap_or(Abort)` | `d, ok := <-ch; if !ok { return Abort }` | **单出口**。Go 的 `chan` 没有「发送方消失」这个信号，只有 `close` 能产生 `ok == false` |
-| sender 被 drop（`Err(RecvError)`） | `close(ch)` | **最容易漏的一处语义差**：Go 不会因为 sender 被 GC 掉而唤醒接收方，必须显式 close |
-| interrupt / 取消 | 另加 `case <-ctx.Done():` | ⚠️ **这不是 Rust 的语义**。Rust 那边 `rx_approve.await` 并没有和 cancellation token 做 select（`session/mod.rs:2875`），它靠的是上面第 3 条的**发送侧顺序**，不是接收侧 select |
+| `oneshot::channel()` | `ch := make(chan T, 1)` | 缓冲 1 可让通知方不依赖接收方此刻是否正在读 |
+| `rx.await.unwrap_or(Abort)` | `d := <-ch` | 单次结果通道；清理路径通过投递显式 `Abort` 收尾 |
+| sender 被 drop（`Err(RecvError)`） | pending map 摘除后发送终止结果 | Go 不会因 sender 被 GC 而关闭 channel；必须由拥有 waiter 的路径显式发送 |
+| interrupt / 取消 | 另设显式 interrupt 路径 | ⚠️ Rust 的 `request_command_approval` 没有将 `rx_approve.await` 与 cancellation token 做 select（`session/mod.rs:2875`）；客户端选 `Abort` 时 `handlers.rs:196-199` 走 `interrupt_task()`，不是普通审批通知 |
 | pending map 的 take 语义 | `v, ok := m[id]; delete(m, id)` | 取走即删除，防双发 |
 | 无 RAII / Drop | turn 结束显式清理 pending map | Go 没有 Drop guard，漏了就泄漏 |
 
 两个必须记住的陷阱：
 
 - **绝不要写 `default:` 分支。** 那会把「没等到答复」变成「直接放行」，审批框就成了装饰。
-- **绝不用 `len(ch) == 0` 判空。** 那是把挂起退回成轮询；而且 close 之后 `len` 也是 0，无法区分「还没答复」和「发送方死了」。
+- **绝不用 `len(ch) == 0` 判空。** 那是把挂起退回成轮询；是否收到结果应由一次接收决定，而不是通过缓冲长度推断。
 
 审批挂起的骨架：
 
 ```go
+// Go channel 不会因 sender 被 drop 自动关闭；用 Once 让通知/清理只完成一次。
+type ApprovalWaiter struct {
+	ch   chan Decision
+	once sync.Once
+}
+
+func (w *ApprovalWaiter) Resolve(d Decision) {
+	w.once.Do(func() {
+		w.ch <- d // 缓冲 1，只允许一个终止结果
+		close(w.ch)
+	})
+}
+
 // 接收侧：单出口，没有 select。
 func (s *Session) RequestApproval(id string) Decision {
-	ch := make(chan Decision, 1) // oneshot：缓冲 1，发送方永不阻塞
+	waiter := &ApprovalWaiter{ch: make(chan Decision, 1)}
 	s.mu.Lock()
 	if s.turnState == nil { // active_turn 不存在 → 无处注册
 		s.mu.Unlock()
 		return Abort
 	}
-	s.pending[id] = ch // 先注册
+	old := s.pending[id]
+	s.pending[id] = waiter // 先注册
 	s.mu.Unlock()
+	if old != nil {
+		old.Resolve(Abort) // 覆盖旧 waiter，显式投递终止结果
+	}
 
 	s.emit(ApprovalRequest{ID: id}) // 再发送
 
-	d, ok := <-ch // 阻塞在这里。这不是 bug，是挂起。
-	if !ok {
-		// 通道被 close == Rust 的 Err(RecvError) == sender 死了。
-		// 三种死法（被覆盖 / 被清表 / 表整体 drop）都收敛到这一个分支。
-		return Abort
-	}
+	d := <-waiter.ch // 阻塞在这里。这不是 bug，是挂起。
 	return d
 }
 
-// 发送侧：先摘表，再投递，最后 close。
+// 发送侧：先摘表，再投递一次决议唤醒接收端。
 func (s *Session) NotifyApproval(id string, d Decision) {
+	if d == Abort {
+		s.interruptTask() // Rust handlers.rs:196-199 将 Abort 映射为 interrupt_task
+		return
+	}
 	s.mu.Lock()
-	ch, ok := s.pending[id]
+	waiter, ok := s.pending[id]
 	if ok {
 		delete(s.pending, id) // 先摘表 → 第二次调用拿不到，天然防双发
 	}
@@ -199,33 +214,32 @@ func (s *Session) NotifyApproval(id string, d Decision) {
 	if !ok {
 		return // 对应 warn!("No pending approval found for call_id")
 	}
-	ch <- d
-	close(ch)
+	waiter.Resolve(d)
 }
 
-// 对应 clear_pending_waiters：一次清五张表 = 一次 close 掉五个 waiter。
-func (s *Session) ClearPendingWaiters() {
+// 清理入口的 Go 示例只模拟审批 waiter map（不是全部五张 Rust 表）。
+func (s *Session) ClearPendingApprovals() {
 	s.mu.Lock()
 	old := s.pending
-	s.pending = map[string]chan Decision{}
+	s.pending = map[string]*ApprovalWaiter{}
 	s.mu.Unlock()
-	for _, ch := range old {
-		close(ch) // ★ Go 里「sender 消失」必须显式 close，否则接收方永远醒不来
+	for _, waiter := range old {
+		waiter.Resolve(Abort) // 显式结束 waiter；Once 防止与通知重复发送
 	}
 }
 ```
 
 ## 5. 挂起怎么收场
 
-「挂起在 turn 内部」意味着审批期间这个 tokio task 一直活着，占着 active_turn 位。好处是上下文（栈上的所有局部状态、client_session）原样保留，审批通过后无缝继续；代价是审批如果永远不来，这个 task 就永远挂着——**没有「超时自动 Abort」**。
+「挂起在 turn 内部」意味着审批期间这个 tokio task 仍存活，占着 active_turn 位。好处是局部状态、`client_session` 原样保留，审批通过后可继续；若 turn 仍保持 active 且没有批准/中断，审批等待没有超时，会一直挂起。
 
-退场机制不是超时，是**表被清**：`clear_pending_waiters`（`state/turn.rs:137-142`）一次 close 五张表，挂在里面的每个 waiter 一起以 `Abort` 惊醒。触发点是 `session/input_queue.rs:207-211` 的 `clear_pending`，调用方两处：
+退场时除了 task 的协作取消/硬 abort，还会清理 waiter 表；`clear_pending_waiters` 本身不是超时器：`state/turn.rs:137-143` 清空五张 map 并 drop 尚存 sender；各 waiter 的接收端对 oneshot 关闭的处理不同，不能概括成「五类 waiter 都以 Abort 醒来」。命令审批的 oneshot 才通过 `unwrap_or(ReviewDecision::Abort)` 映射成 Abort。清理入口是 `session/input_queue.rs:206-211` 的 `clear_pending`，调用方包括：
 
 - `tasks/mod.rs:536`（`abort_all_tasks`）/ `:582`（`abort_turn_if_active`）——turn abort
 - `session/turn_suspension.rs:98`——turn 挂起移交，注释原话：「Pending accepted input and interactive waiters live only in this process. Handoff intentionally drops that state; persisting or replaying it needs a separate protocol.」
 
 **一个反直觉的点**：hard abort 路径下，`handle_task_abort` 里的 `task.handle.abort()`（`tasks/mod.rs:916`）已经把 future 丢掉了，所以那个 `rx_approve.await` **根本不会再跑**——它返回的 `None` 没人读。`clear_pending` 排在这之后（:533-536 的顺序），真正的作用对象是**优雅收场**和**仍然活着的其他 waiter**（权限请求 / 用户提问 / elicitation），不是「通知这条 await」。
 
-另外：`request_command_approval` 里的 `rx_approve.await` 并没有和 cancellation token 做 select（`session/mod.rs:2875`），所以一个正停在这次 await 上的 task，理论上在那 100ms 优雅窗口里也感知不到取消。`tasks/mod.rs:534-535` 注释说的「let interrupted tasks observe cancellation」具体靠哪个 await 点生效，没追。
+另外：`request_command_approval` 里的 `rx_approve.await` 并没有和 cancellation token 做 select（`session/mod.rs:2875`）。但需区分整个工具链：审批 reviewer 的上游调用通常可在 `tools/approvals.rs:667-718` 与 `tools/parallel.rs:202-205` 的 cancellation select 响应取消；本段 `rx_approve.await` 本身不能直接响应 cancellation token。
 
 （以上均为阅读观察，非上游结论。）

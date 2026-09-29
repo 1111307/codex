@@ -109,7 +109,7 @@ func (a *Agent) submissionLoop() {
 
 ## 3. spawn_agent 全流程
 
-模型调 `spawn_agent` 时，它就是个普通 tool handler：`codex-rs/core/src/tools/handlers/multi_agents/spawn.rs:47-134` 的 `handle_spawn_agent` 构造子 agent 配置，调用 `AgentControl::spawn_agent_with_metadata`；内部进入 `agent/control/spawn.rs:614-819` 的 `spawn_agent_internal`。配置从当前 turn 刷新模型、审批、cwd 和 permission profile（`tools/handlers/multi_agents_common.rs:170-264`），role 在此基础上覆盖允许的字段；`fork_context=true` 才会选择完整父历史 fork（`spawn.rs:94-109, 121-124`）。**这里只建会话和提交输入，尚未启动 OS 命令进程或沙箱。**
+模型调 `spawn_agent` 时，它就是个普通 tool handler：`codex-rs/core/src/tools/handlers/multi_agents/spawn.rs:47-134` 的 `handle_spawn_agent` 构造子 agent 配置，调用 `AgentControl::spawn_agent_with_metadata`；内部进入 `agent/control/spawn.rs:614-819` 的 `spawn_agent_internal`。配置从当前 turn 刷新模型、审批、cwd 和 permission profile（`tools/handlers/multi_agents_common.rs:170-264`）。**非 fork 路径**才在此基础上应用 role 覆盖（`spawn.rs:105-107`）；`fork_context=true` 会选择完整父历史 fork（`:94-95, 121-124`），并拒绝 `agent_type` 覆盖，而不是再叠加 role 配置。**这里只建会话和提交输入，尚未启动 OS 命令进程或沙箱。**
 
 深度检查在 handler 里，`multi_agents/spawn.rs:68-74`：
 
@@ -136,12 +136,17 @@ pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bo
 Go 版全流程（省略 V2 residency slot 与 execution limiter，不能直接运行）：
 
 ```go
-func (c *AgentControl) SpawnAgent(cfg Config, input []UserInput, src SessionSource) (*LiveAgent, error) {
-    // cfg 假设已从父 turn 的生效快照生成；fork_context 分支省略。
+func (c *AgentControl) SpawnAgent(cfg Config, input []UserInput, src SessionSource, forkContext bool, role string) (*LiveAgent, error) {
+    // cfg 假设已从父 turn 的生效快照生成；role 已归一化。
     // ① 深度闸门 —— multi_agents/spawn.rs:68-74
     childDepth := src.Depth + 1
     if childDepth > cfg.AgentMaxDepth {
         return nil, ErrRespondToModel("Agent depth limit reached. Solve the task yourself.")
+    }
+    if forkContext {
+        if role != "" { return nil, ErrFullForkAgentTypeOverride }
+    } else {
+        cfg.ApplyRole(role) // 仅非 fork 路径应用 role
     }
 
     // ② 抢名额 —— registry.rs:96-115
@@ -304,7 +309,6 @@ match thread
                 return;
             }
 ```
-```
 
 非 V2 正常路径在 `control.rs:706-714` 向父会话注入 `SubagentNotification`：
 
@@ -354,7 +358,7 @@ func notifyParentOnTerminalTurn(child *Agent, parent *Agent, event TurnEvent) {
 
 ### ③ 查询：wait_agent
 
-`codex-rs/core/src/tools/handlers/multi_agents/wait.rs:307-327`：
+实现订阅所有目标状态；若订阅过程中发现任何初始终态，就返回已收集的初始终态；否则等到至少一个后续终态或 timeout，并收割当时已 ready 的额外终态。源码见 `codex-rs/core/src/tools/handlers/multi_agents/wait.rs:120-189`；单个 watcher 的终态等待逻辑见 `:307-327`：
 
 ```rust
 async fn wait_for_final_status(
@@ -393,7 +397,7 @@ let timeout_ms = match timeout_ms {
 };
 ```
 
-Go 版（示意：`WaitFinal` 要正确实现订阅、取消和终态判断；实际 Rust 还会收割同时就绪的其他结果，见 `wait.rs:159-189`）：
+Go 版（示意：`WaitFinal` 要正确实现订阅、取消和终态判断；Rust 返回初始终态集合，或等待第一个结果后非阻塞收割 ready futures，见 `wait.rs:159-189`。Go channel 收割只近似这一并发语义）：
 
 ```go
 func (c *AgentControl) WaitAgent(targets []ThreadID, timeoutMs int) WaitResult {
@@ -403,8 +407,11 @@ func (c *AgentControl) WaitAgent(targets []ThreadID, timeoutMs int) WaitResult {
     for _, id := range targets {
         w, err := c.SubscribeStatus(id)
         if err != nil {
-            done = append(done, Result{id, AgentNotFound})  // NotFound 也算终态
-            continue
+            if errors.Is(err, ErrThreadNotFound) {
+                done = append(done, Result{id, AgentNotFound}) // Rust 将 ThreadNotFound 记为 NotFound 终态
+                continue
+            }
+            return WaitResult{}, err // Rust 对其他订阅错误返回错误
         }
         if status := w.Value(); status.IsFinal() {
             done = append(done, Result{id, status})
@@ -415,8 +422,11 @@ func (c *AgentControl) WaitAgent(targets []ThreadID, timeoutMs int) WaitResult {
     if len(done) > 0 {
         return WaitResult{Status: done, TimedOut: false}
     }
+    if len(watches) == 0 {
+        return WaitResult{Status: nil, TimedOut: true} // 与 Rust 的空结果 timed_out=true 对齐
+    }
 
-    // ② 并发等所有 watch
+    // ② 并发等待至少一个 watcher 到达终态
     ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
     defer cancel()
 
@@ -427,10 +437,19 @@ func (c *AgentControl) WaitAgent(targets []ThreadID, timeoutMs int) WaitResult {
         }(w)
     }
 
-    // ③ 至少等一个终态；实际 Rust 还会收割此刻已就绪的其他终态。
+    // ③ 至少等一个终态；之后非阻塞收割已送入 channel 的其他结果。
+    // Go 调度与 channel 发送时序和 Rust FuturesUnordered 的 ready 语义并不完全相同。
     select {
     case r := <-ch:
-        return WaitResult{Status: []Result{r}, TimedOut: false}
+        done = append(done, r)
+        for {
+            select {
+            case ready := <-ch:
+                done = append(done, ready)
+            default:
+                return WaitResult{Status: done, TimedOut: false}
+            }
+        }
     case <-ctx.Done():
         return WaitResult{Status: nil, TimedOut: true}
     }

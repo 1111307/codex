@@ -119,7 +119,15 @@ func (s *Session) runTurn(ctx context.Context, input []Input) (string, error) {
             continue
         }
         if needsFollowup { continue }
-        if s.stopHookBlocks() { continue } // 实际还会追加续跑 prompt
+        outcome := s.runStopHooks()
+        if outcome.Blocked {
+            if prompt, ok := buildContinuationPrompt(outcome.Fragments); ok {
+                s.record(prompt)
+                continue // 对应 turn.rs:661-678；只有有续跑 prompt 才继续
+            }
+            s.warn("Stop hook requested continuation without a prompt; ignoring the block.")
+        }
+        if outcome.ShouldStop { return step.LastAgentMessage, nil } // 对应 turn.rs:689-702；简化：省略 legacy after-agent hook 等分支
         return step.LastAgentMessage, nil
     }
 }
@@ -131,7 +139,7 @@ func (s *Session) runTurn(ctx context.Context, input []Input) (string, error) {
 
 调用链：`tools/router.rs:244-288` 将模型 function call 分派为 tool call → `tools/handlers/multi_agents/spawn.rs:47-133` 解析参数、检验 depth（:68-74）、从当前 turn 构造子配置（:92-109）并调用 `AgentControl::spawn_agent_with_metadata`（:111-133）。超深度按 `FunctionCallError::RespondToModel` 返给模型，不是杀进程。
 
-`tools/handlers/multi_agents_common.rs:170-176` 的注释原话：
+`tools/handlers/multi_agents_common.rs:170-176` 的注释原话（描述 spawn config builder 的共通用途；但完整 fork 会拒绝 agent type 覆盖，且不应用 role overlay，见 `multi_agents/spawn.rs:94-107`）：
 
 ```rust
 /// The returned config starts from the parent's effective config and then refreshes the
@@ -141,7 +149,7 @@ func (s *Session) runTurn(ctx context.Context, input []Input) (string, error) {
 /// agent out with the wrong provider or runtime policy.
 ```
 
-`:195-220` 刷新模型、provider、reasoning、developer instructions；`:238-264` 复制 live turn 的审批策略、cwd、permission profile snapshot；用户选的 role 在 `spawn.rs:105-109` 中随后叠加，role 允许修改的字段见 `agent/role.rs:79-89`。**子 agent 继承的是当前生效权限配置，不是重新从本地默认值计算一遍。** 若 `fork_context=true`，`control/spawn.rs:684-695` 走 fork 历史路径，fork 前会 flush 父历史并读取上下文（`:883-912`）；否则 :697-722 建新会话。默认不要误认为完整复制父历史。
+`:195-220` 刷新模型、provider、reasoning、developer instructions；`:238-264` 复制 live turn 的审批策略、cwd、permission profile snapshot。非 fork 路径才由 `spawn.rs:105-107` 应用用户 role（可覆盖字段见 `agent/role.rs:79-89`）；完整 history fork 会拒绝 `agent_type` 覆盖（`:94-96`），不能笼统说 role 总会叠加。**子 agent 继承的是当前生效权限配置，不是重新从本地默认值计算一遍。** 若 `fork_context=true`，`control/spawn.rs:684-695` 走 fork 历史路径，fork 前会 flush 父历史并读取上下文（`:883-912`）；否则 :697-722 建新会话。默认不要误认为完整复制父历史。
 
 `agent/control.rs:117-139`：一棵 root agent 树共用一个 `AgentControl`（registry、限额等）；`agent/control/spawn.rs:631-652` 检查执行容量、可选预留 V2 residency slot，再预留 spawn 配额；`:684-725` 用**同一个控制面**调用 ThreadManager 建新 thread；`thread_manager.rs:2096-2155` 调用 `Session::spawn`；`session/mod.rs:877-883` 起子 session 的 submission_loop；`thread_manager.rs:2180-2213` 收到 `SessionConfigured` 才把它放进全局 thread map；`agent/control/spawn.rs:726-799` 注册子 agent 后送首条输入。子 session 的 turn 同样由 `RegularTask` 驱动。
 
@@ -162,11 +170,16 @@ type Agent struct {
 }
 
 // 示意，不是可直接运行的实现：
-// parent 当前配置视为已从 turn 的有效快照刷新；fork_context 分支在这里省略。
+// parent 当前配置视为已从 turn 的有效快照刷新；完整 fork 不应用 role 覆盖。
 func (c *Control) Spawn(parent *Agent, req SpawnRequest) (*Agent, error) {
     if parent.Depth+1 > parent.MaxDepth { return nil, ErrDepthLimit }
     cfg := cloneEffectiveTurnConfig(parent.Session) // 模型、审批、cwd、权限快照
-    cfg.ApplyRole(req.Role)                         // 仅允许的 role 覆盖项
+    if req.ForkContext {
+        if req.Role != "" { return nil, ErrFullForkAgentTypeOverride }
+        // 完整历史 fork 继承父 agent type，不叠加 role
+    } else {
+        cfg.ApplyRole(req.Role) // 仅允许的 role 覆盖项
+    }
     slot, err := c.registry.Reserve(cfg.MaxAgents)
     if err != nil { return nil, err }
     committed := false
