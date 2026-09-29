@@ -232,7 +232,7 @@ func runCommand(ctx context.Context, env TurnEnvironment, request Command) (Outp
 }
 ```
 
-**最值得记的一句：**`spawn_agent` 启动的是一个会思考和接任务的 session；`exec_command` 才启动 OS 子进程，并且**每次工具执行尝试**以当时生效的 permission profile 判断是否需要沙箱、选择可用后端（也可能是 `None`）。前者继承权限状态，不直接调用沙箱后端。
+**最值得记的一句：**`spawn_agent` 启动的是一个会思考和接任务的 session；`exec_command` 才启动 OS 子进程，并且**每次工具执行尝试**以当时生效的 permission profile 判断是否需要沙箱、选择可用后端（也可能是 `None`）。前者继承权限状态，不直接调用沙箱后端。这条链的逐函数调用时序（含审批在 spawn 前、`already_approved` 的实际用途）展开在 [exec-command-chain.md](exec-command-chain.md)；本节的 Go 示意是其压缩版。
 
 ## 没验证的
 

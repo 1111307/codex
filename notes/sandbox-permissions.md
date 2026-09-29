@@ -1,6 +1,6 @@
 # 沙箱权限：控制进程与工具子进程的边界
 
-围绕一个问题：Codex 启动后到底拿到了什么权限？结论先行——**Codex Rust 控制进程本身通常不在它为工具搭建的沙箱内；执行工具启动的本地 OS 子进程按当前权限策略选择沙箱**。子 agent 的创建只是新建会话，不会因此直接起沙箱进程。完整时序见 [loops-agents-sandbox-go.md](loops-agents-sandbox-go.md)。
+围绕一个问题：Codex 启动后到底拿到了什么权限？结论先行——**Codex Rust 控制进程本身通常不在它为工具搭建的沙箱内；执行工具启动的本地 OS 子进程按当前权限策略选择沙箱**。子 agent 的创建只是新建会话，不会因此直接起沙箱进程。完整时序见 [loops-agents-sandbox-go.md](loops-agents-sandbox-go.md)；本文讲权限的静态语义，一次 `exec_command` 从审批到 spawn 的运行时链路见 [exec-command-chain.md](exec-command-chain.md)。
 
 ## 1. 三档模式与默认值
 
